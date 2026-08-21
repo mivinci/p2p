@@ -62,7 +62,7 @@ sequenceDiagram
         T-->>A: 注册确认
         A->>T: login(peer_id, nonce_signature)
         T-->>A: session JWT；punch JWT（aud=Punch A，scope=punch）；STUN/TURN 配置
-        A->>PA: join(punch JWT, proof_of_possession)
+        A->>PA: join(punch JWT, signature)
         PA-->>A: binding_id、binding_key、expires_at
         A->>STUN: Binding Request
         STUN-->>A: A candidates（host / srflx）
@@ -71,7 +71,7 @@ sequenceDiagram
         T-->>B: 注册确认
         B->>T: login(peer_id, nonce_signature)
         T-->>B: session JWT；punch JWT（aud=Punch B，scope=punch）；STUN/TURN 配置
-        B->>PB: join(punch JWT, proof_of_possession)
+        B->>PB: join(punch JWT, signature)
         PB-->>B: binding_id、binding_key、expires_at
         B->>STUN: Binding Request
         STUN-->>B: B candidates（host / srflx）
@@ -198,7 +198,7 @@ Tracker 验签后，将 `peer_id` 加入 `revoked` 列表（带吊销时间戳�
 
 ### 3.2 Binding：`join`、`heartbeat` 与 `exit`
 
-客户端使用仅面向自身 Punch Server 的 `punch JWT` 建立 Binding，并使用 `peer_id` 对应私钥对本次请求的 nonce、`punch_id`、时间戳签名，证明令牌持有者确实控制该身份。单独的 bearer JWT **不得**作为 join 的唯一凭据；nonce **必须**一次性消费（Punch Server 维护覆盖时间窗口两倍时长的去重记录），时间戳超出短窗口的请求**必须**拒绝，否则被截获的 join 请求在 JWT 有效期内可被重放。Punch Server 验签并验证该证明后创建 `binding_id`，并通过该加密信道的已认证响应返回随机生成的会话级 `binding_key`。此 Binding 代表"该 peer 当前可通过这个 Punch Server 被联系到"。
+客户端使用仅面向自身 Punch Server 的 `punch JWT` 建立 Binding，并使用 `peer_id` 对应私钥对 punch JWT 本体与时间戳签名，证明令牌持有者确实控制该身份。单独的 bearer JWT **不得**作为 join 的唯一凭据。防重放依赖 punch JWT 的一次性 `jti`——Punch Server 维护已消费 `jti` 记录（覆盖 punch JWT `exp` 两倍时长），首次 join 消费 `jti`，后续同 `jti` 的 join 请求**必须**拒绝；客户端重连或 binding 过期时需重新 `login` 获取新的 punch JWT。`timestamp` 仍纳入签名内容以约束签名时效，超出短窗口的请求**必须**拒绝。Punch Server 验签并验证该证明后创建 `binding_id`，并通过该加密信道的已认证响应返回随机生成的会话级 `binding_key`。此 Binding 代表"该 peer 当前可通过这个 Punch Server 被联系到"。
 
 之后的保活使用 `heartbeat(binding_id, seq, MAC)`，而不是每次发送完整 JWT。MAC 固定为 `HMAC-SHA-256(binding_key, binding_id || seq || timestamp || transport_generation)`；服务端仅接受递增序列号（允许一个有限乱序窗口）且 timestamp 在短窗口内的请求。Binding 到期、客户端重新 join、或网络切换时，旧 `binding_key` 和旧序列号空间立即失效。这样既刷新 NAT 映射和在线 TTL，也避免频繁验签与较大的 UDP 包。
 
@@ -359,11 +359,11 @@ scheme 复用通用的 `magnet:`（BT 未发明专属 scheme，复用的正是 m
 | JWT 用途 | `aud` | `scope` | 关键附加 claims | 典型有效期 |
 | --- | --- | --- | --- | --- |
 | Tracker API 会话 | `tracker` | `query`、`announce` | `sub` | 分钟级至小时级 |
-| 建立/刷新 Punch Binding | 指定 `punch_id` | `punch` | `sub` | 10–30 分钟 |
+| 建立/刷新 Punch Binding | 指定 `punch_id` | `punch` | `sub`、一次性 `jti` | 10–30 分钟 |
 | 请求连接目标 Peer | 指定 `punch_b_id` | `connect` | `sub`、`sub_pub`（发起方公钥）、`target_peer_id`、`info_hash`、`connection_id`（即一次性 `jti`） | 数十秒 |
 | TURN 中继授权 | 指定 `turn_region_id` | `relay` | `connection_id`、对端 `peer_id`、带宽/连接数/时长配额（以 `relay` JWT 或 TURN REST username/HMAC 承载） | 分钟级 |
 
-每个服务**应当**至少校验：签名算法和签名、`iss`、`kid`、`aud`、`scope`、`sub`、`nbf`/`exp`；对于 `connect` JWT，还应校验 `target_peer_id`、`info_hash`、`sub_pub`（确认 `sub == SHA-256(sub_pub)` 即发起方公钥与身份一致），以及 `connection_id`（即 `jti`）的一次性消费语义。
+每个服务**应当**至少校验：签名算法和签名、`iss`、`kid`、`aud`、`scope`、`sub`、`nbf`/`exp`；对于 `connect` JWT，还应校验 `target_peer_id`、`info_hash`、`sub_pub`（确认 `sub == SHA-256(sub_pub)` 即发起方公钥与身份一致），以及 `connection_id`（即 `jti`）的一次性消费语义；对于 `punch` JWT，应校验 `jti` 的一次性消费语义（每次 `punch.join` 消费一个 `jti`，重连需重新 login 获取新 punch JWT）。
 
 ## 7. 接口契约与运行边界
 
@@ -371,7 +371,7 @@ scheme 复用通用的 `magnet:`（BT 未发明专属 scheme，复用的正是 m
 
 Tracker API 基于 HTTPS REST：每个请求独立无状态，session JWT 通过 `Authorization: Bearer <jwt>` 头携带，请求/响应体使用 JSON 编码（`Content-Type: application/json`）。Tracker 不向客户端推送消息，两者之间不维护常驻信道——除 `register` 与 `revoke` 是一次性身份管理请求（不携带 session JWT）外，其余请求均携带 session JWT 按需调用。
 
-`punch.join` / `punch.exit` / `punch.signal` 的请求响应控制面经加密认证信道传输（TCP+TLS、UDP+DTLS 或 QUIC 均可，客户端与 Punch Server 间的常驻与瞬时信令信道同此要求）；为维持 NAT 映射的 `punch.heartbeat` 可以使用 UDP，但**必须**遵循前述 MAC、时钟窗口和序列号校验。消息使用版本化 schema；未知必填字段、超出大小限制的 candidate 列表和不匹配的 `connection_id` 都**必须**拒绝。每个响应至少带协议版本、请求 ID 和明确的错误码。所有时钟校验（`nbf`/`exp`、heartbeat 的时间戳窗口）使用统一的服务端可配置容差（如 ±60 秒），客户端**应当**与可信时间源对时，容差需计入 nonce 去重窗口与序列号乱序窗口的计算。
+`punch.join` / `punch.exit` / `punch.signal` 的请求响应控制面经加密认证信道传输（TCP+TLS、UDP+DTLS 或 QUIC 均可，客户端与 Punch Server 间的常驻与瞬时信令信道同此要求）；为维持 NAT 映射的 `punch.heartbeat` 可以使用 UDP，但**必须**遵循前述 MAC、时钟窗口和序列号校验。消息使用版本化 schema；未知必填字段、超出大小限制的 candidate 列表和不匹配的 `connection_id` 都**必须**拒绝。每个响应至少带协议版本、请求 ID 和明确的错误码。所有时钟校验（`nbf`/`exp`、heartbeat 的时间戳窗口）使用统一的服务端可配置容差（如 ±60 秒），客户端**应当**与可信时间源对时，容差需计入 Tracker 的 nonce 去重窗口、Punch/Tracker 的 `jti` 去重窗口与序列号乱序窗口的计算。
 
 ### 7.2 接口契约表
 
@@ -657,14 +657,12 @@ Punch Server 上的接口走加密认证信道（非 REST），以 RPC 风格的
 
 ##### `punch.join`
 
-建立 Binding。
+建立 Binding。一步完成，无 challenge 前置。
 
 | 请求字段 | 类型 | 说明 |
 | --- | --- | --- |
-| `punch_jwt` | string | 来自 login 的 punch JWT（`scope=punch`） |
-| `nonce` | string | Punch Server 下发的一次性随机数 |
-| `punch_id` | string | punch JWT 的 `aud` |
-| `signature` | string | `sign(private_key, "join" \|\| nonce \|\| punch_id \|\| timestamp)` 的 base64 |
+| `punch_jwt` | string | 来自 login 的 punch JWT（`scope=punch`，含一次性 `jti`） |
+| `signature` | string | `sign(private_key, "join" \|\| punch_jwt_raw \|\| timestamp)` 的 base64，其中 `punch_jwt_raw` 是 punch JWT 的完整序列化字符串 |
 | `timestamp` | int64 | 请求时间戳 |
 
 | 响应字段 | 类型 | 说明 |
@@ -673,7 +671,7 @@ Punch Server 上的接口走加密认证信道（非 REST），以 RPC 风格的
 | `binding_key` | string | 会话级对称密钥（HMAC 用） |
 | `expires_at` | int64 | Binding 过期时间 |
 
-**授权与限制**：JWT + 持钥证明；nonce 一次性消费；`peer_id` 未被吊销；新 binding 替换旧 binding。
+**授权与限制**：JWT + 持钥证明；punch JWT 的 `jti` 一次性消费（Punch Server 维护已消费 `jti` 记录，覆盖 punch JWT `exp` 两倍时长）；`peer_id` 未被吊销；新 binding 替换旧 binding。客户端重连或 binding 过期时需重新 `login` 获取新 punch JWT。
 
 **交互流程**：
 
@@ -682,32 +680,27 @@ sequenceDiagram
     participant B as client (B)
     participant PB as Punch Server
 
-    Note over B: 已通过 login 获得 punch JWT
+    Note over B: 已通过 login 获得 punch JWT (含 jti)
     Note over B: 已建立到 PB 的加密信道
 
-    B->>PB: punch.challenge(peer_id)
-    Note over PB: 生成 nonce
-    Note over PB: 存内存: nonce → (peer_id, 短过期)
-    PB-->>B: {nonce, punch_id, expires_at}
+    Note over B: 签名: sign(priv, "join" || punch_jwt_raw || ts)
 
-    Note over B: 签名: sign(priv, "join" || nonce || punch_id || ts)
-
-    B->>PB: punch.join(punch_jwt, nonce, punch_id, signature, ts)
+    B->>PB: punch.join(punch_jwt, signature, ts)
     Note over PB: 验 punch JWT (签名, aud, scope, exp)<br/>JWT 的 sub == peer_id?
-    Note over PB: 查 nonce 有效且属于该 peer_id
+    Note over PB: 查 jti 未被消费过
     Note over PB: 查 peer_id 未被吊销 (查 Tracker 或缓存)
-    Note over PB: 取 public_key 验签
-    Note over PB: 删除 nonce (一次性)
+    Note over PB: 取 JWT 的 sub_pub (或从 sub 派生) 验签 signature
+    Note over PB: 标记 jti 已消费 (一次性)
     Note over PB: 生成 binding_id (随机)
     Note over PB: 生成 binding_key (随机 32 字节对称密钥)
     Note over PB: 旧 binding (如有) 立即失效
     Note over PB: 入库: binding_id → (peer_id, binding_key, TTL)
     PB-->>B: {binding_id, binding_key, expires_at}
 
-    Note over B: 本地保存 binding_id + binding_key<br/>后续 heartbeat/leave 用 binding_key 做 HMAC, 不再签名
+    Note over B: 本地保存 binding_id + binding_key<br/>后续 heartbeat/exit 用 binding_key 做 HMAC, 不再签名
 ```
 
-`punch.challenge` 是 `punch.join` 的前置步骤，获取 Punch Server 下发的 nonce。它与 login 的 challenge 机制同构——Punch Server 对客户端零先验，必须用随机数防重放。
+**为什么 join 不需要 challenge**：防重放靠 punch JWT 的一次性 `jti`——首次 join 消费 `jti`，重放同 `jti` 的请求被拒。客户端重连时重新 login 拿新 punch JWT（新 `jti`），不需要在 Punch Server 侧维护 nonce 内存表。`timestamp` 仍纳入签名以约束签名时效。相比 challenge 两步方案，少一次往返，Punch Server 状态更少。
 
 **为什么 join 也要签名**：Punch Server 是独立服务，对客户端**零先验**。punch JWT 证明 Tracker 授权了这次接入，但 JWT 可能被偷。签名证明"持有 peer_id 对应的私钥"，把"JWT 持有者"和"私钥持有者"绑定。
 
