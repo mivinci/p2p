@@ -23,9 +23,7 @@
 - **STUN Server**：供 ICE 收集公网映射候选地址。
 - **TURN / Relay Server**：无法直连时经 ICE relay candidate 转发数据流。
 
-**`peer_id`**：由客户端长期保存的 Ed25519 公钥派生（`SHA-256(public_key)`），32 字节，由客户端本地生成、不由 Tracker 分配——密钥即身份，Tracker 只是发现与授权的控制面（密钥轮换即更换身份，见第 3.1 节）。机器间协议始终使用二进制 `peer_id`。
-
-**`peer_fingerprint`**：`peer_id` 的可读编码，用于客户端 UI 显示、用户肉眼确认与手动输入场景。格式为 `p2p:` + base32(`peer_id` 前 12 字节) + bech32 校验位，分 5 组以连字符分隔，共 24 字符，例如 `p2p:ABCD2345-EFGH6789-JKL0-XXXX`。base32 字母表为 RFC 4648（不含 `0/O/1/I` 以避免视觉混淆），bech32 校验位（BCH 码）可检测 4 位以内的转录错误。fingerprint 仅作人机界面层编码，**不得**出现在协议消息中；两台设备上 fingerprint 一致即代表同一身份。
+**`peer_id`**：由客户端长期保存的 Ed25519 公钥派生的可读字符串，格式为 `peer:` + base32(SHA-256(public_key)) + bech32 校验位，约 58 字符，例如 `peer:ABCDEF234567...`。客户端本地生成密钥对、不由 Tracker 分配——密钥即身份，Tracker 只是发现与授权的控制面（密钥轮换即更换身份，见第 3.1 节）。base32 字母表为 RFC 4648（不含 `0/O/1/I` 以避免视觉混淆），bech32 校验位（BCH 码）可检测 4 位以内的转录错误。`peer_id` 同时用于协议消息、UI 显示、数据库主键——不再区分"二进制 ID"与"可读编码"。
 
 **Ed25519**：本设计全程使用 Ed25519 作为签名算法。选择理由：公钥仅 32 字节、签名 64 字节、验签速度比 RSA-2048 快 10–50 倍（对每次 `enter` 都要签名的移动端场景关键）、抗侧信道攻击。本设计**不**使用 RSA、ECDSA 或 GPG/OpenPGP 密钥格式——客户端自己生成并保存 Ed25519 密钥对，不依赖外部密钥管理工具。
 
@@ -189,15 +187,14 @@ Tracker 验签后，将 `peer_id` 加入 `revoked` 列表（带吊销时间戳�
 
 `revoked` 列表带 TTL（**应当**为 7 天，与 register TTL 解耦）。TTL 到期后 `peer_id` 可被重新注册——这平衡了"吊销有效性"与"peer_id 永久占用"。Token 丢失时只能等 register TTL 过期后重新注册（期间身份仍可被冒充，因此客户端**应当**妥善备份 token）。
 
-#### 3.1.5 客户端 UI 中的 fingerprint
+#### 3.1.5 客户端 UI 中的 peer_id
 
-客户端 UI **应当**在"我的身份"页面同时显示：
+客户端 UI **应当**在"我的身份"页面显示：
 
-- `peer_fingerprint`（24 字符，分 5 组）：用于肉眼快速识别、添加好友、口耳相传确认
-- 完整 `peer_id`（32 字节 hex，折叠显示）：用于高级场景的诊断与日志检索
-- 二维码：编码 `peer_fingerprint`，方便线下扫码添加
+- `peer_id`（完整字符串）：用于复制、搜索、添加好友、扫码
+- 二维码：编码 `peer_id`，方便线下扫码添加
 
-用户在两台设备上确认 fingerprint 一致即可确认是同一身份，无需比对完整 `peer_id`。**不得**在协议消息、日志或 URL 中使用 fingerprint——机器间始终用二进制 `peer_id`，fingerprint 仅在客户端 UI 层编码与解码。
+`peer_id` 本身就是可读字符串，无需额外编码或截断。用户复制粘贴、二维码扫描、搜索框输入都用同一个值。
 
 ### 3.2 Binding：`enter`、`heartbeat` 与 `leave`
 
