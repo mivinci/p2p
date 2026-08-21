@@ -400,6 +400,32 @@ Tracker API 基于 HTTPS REST：每个请求独立无状态，session JWT 通过
 
 **授权与限制**：验证 `peer_id == SHA-256(public_key)` 与签名；`peer_id` 未被注册或已过期才允许；同 `peer_id` 重复注册幂等返回原记录。TTL 90 天（可配置）。
 
+**交互流程**：
+
+```
+client                           Tracker
+  |  本地生成 Ed25519 密钥对        |
+  |  计算 peer_id = peer:base32    |
+  |  (sha256(pub)) + checksum      |
+  |  签名: sign(priv, "register"   |
+  |        || peer_id || pub || ts)|
+  |                                |
+  |  POST /peers {peer_id,         |
+  |    public_key, signature,      |
+  |    timestamp}                  |
+  |------------------------------>>|
+  |                                |  查注册表: peer_id 未注册或已过期?
+  |                                |  验证 peer_id == SHA-256(public_key)
+  |                                |  取 public_key 验签
+  |                                |  入库: peer_id → public_key, TTL 90 天
+  |<<------------------------------|  201 {registered_at, expires_at}
+  |                                |
+  |  本地保存私钥 (Keychain/Keystore)
+  |  本地生成并保存 revocation_token (见 revoke)
+```
+
+register 不需要 nonce，因为这是客户端**第一次**联系 Tracker，Tracker 对客户端一无所知，没有先验可以发 nonce。防重放靠 `timestamp` 窗口 + 同 `peer_id` 重复注册幂等返回。
+
 ##### `DELETE /peers/{peer_id}` — revoke
 
 私钥泄露时调用，一次性。不携带 session JWT。
@@ -413,6 +439,27 @@ Tracker API 基于 HTTPS REST：每个请求独立无状态，session JWT 通过
 | `204 No Content` | 吊销成功 |
 
 **授权与限制**：验证 token 签名；将 `peer_id` 加入 `revoked` 列表，TTL 7 天。被吊销 `peer_id` 的所有后续请求拒绝。
+
+**交互流程**：
+
+```
+client                           Tracker
+  |  (私钥已泄露, 取出之前保存的     |
+  |   revocation_token)            |
+  |                                |
+  |  DELETE /peers/{peer_id}       |
+  |  {revocation_token}            |
+  |------------------------------>>|
+  |                                |  取 public_key 验签 token
+  |                                |  加入 revoked 列表 (TTL 7 天)
+  |                                |  标记该 peer_id 所有在途 session JWT 失效
+  |<<------------------------------|  204 No Content
+  |                                |
+  |  (攻击者即使持有旧私钥,         |
+  |   后续 login/enter 被拒绝)     |
+```
+
+revoke 不需要 nonce——`revocation_token` 是在 `register` 时就用私钥签好的静态声明（`sign(priv, "revoke" || peer_id || timestamp)`），一次签好后离线保存，泄露时提交即可。`timestamp` 在 token 生成时固定，Tracker 校验的是 token 签名而非时间窗口。
 
 ##### `POST /sessions` — login
 
@@ -451,6 +498,46 @@ GET /sessions/challenge?peer_id=<peer_id>
 
 **授权与限制**：验证签名；nonce 一次性消费；`peer_id` 未被吊销；同时刷新 register TTL。
 
+**交互流程**：
+
+```
+client                           Tracker
+  |                                |
+  |  GET /sessions/challenge       |
+  |    ?peer_id=peer:ABCDEF...     |
+  |------------------------------>>|
+  |                                |  查注册表取 public_key
+  |                                |  生成 32 字节随机 nonce
+  |                                |  存内存: nonce → (peer_id, 60s 过期)
+  |<<------------------------------|  {nonce, expires_at}
+  |                                |
+  |  用 private_key 签名:           |
+  |  sig = sign(priv, "login"      |
+  |    || peer_id || nonce || ts)  |
+  |                                |
+  |  POST /sessions                |
+  |  {peer_id, nonce, signature,   |
+  |   timestamp}                   |
+  |------------------------------>>|
+  |                                |  查 nonce 在内存? 属于该 peer_id?
+  |                                |  未过期?
+  |                                |  取 public_key 验签
+  |                                |  删除 nonce (一次性消费)
+  |                                |  检查 peer_id 未被吊销
+  |                                |  签发 session JWT (scope=query,announce)
+  |                                |  签发 punch JWT (scope=punch, aud=punch_id)
+  |                                |  刷新 register TTL
+  |<<------------------------------|  {session_jwt, punch_jwt,
+  |                                   punch_server, stun_servers,
+  |                                   turn_servers, session_expires_at}
+```
+
+**为什么两步**：Tracker 要让客户端证明"持有 peer_id 对应的私钥"，但签名内容必须包含 Tracker 下发的随机数，否则签名可被重放。第一步取随机数，第二步签随机数。攻击者即使截获完整的 `{nonce, signature}` 也无法重放——nonce 用一次就删。
+
+**为什么 nonce 由 Tracker 生成**：如果客户端自己生成 nonce 再签，Tracker 没有记录"这个 nonce 用过"，攻击者可以重放整个 `{nonce, signature}`。Tracker 必须自己生成 nonce 并追踪是否已消费。
+
+**为什么还要签 timestamp**：nonce 已防重放，`timestamp` 是额外保险——即使 nonce 机制出 bug，timestamp 超出窗口（±60 秒）的请求也被拒。同时 timestamp 让客户端的签名带时间戳，防止 token 被长期保存后跨场景复用。
+
 ##### `PUT /peers/{peer_id}/resources` — announce
 
 登记或撤下自己持有的资源。携带 session JWT。
@@ -467,6 +554,32 @@ GET /sessions/challenge?peer_id=<peer_id>
 | `expires_at` | int64 | 服务端裁剪后的过期时间 |
 
 **授权与限制**：session `announce`；同一 peer/file 覆盖更新；限制 TTL 上限、批量大小、资源数和调用频率。
+
+**交互流程**：
+
+```
+client                           Tracker
+  |                                |
+  |  PUT /peers/{peer_id}/resources|
+  |  Authorization: Bearer <jwt>   |
+  |  {add: [hash1, hash2],          |
+  |   del: [hash3],                |
+  |   complete: [hash1],            |
+  |   ttl: 1800}                   |
+  |------------------------------>>|
+  |                                |  验 session JWT (scope 含 announce?)
+  |                                |  sub 与 path 中的 peer_id 一致?
+  |                                |  检查批量大小/TTL 上限/频率限制
+  |                                |  add 的 info_hash 入库 (peer_id → info_hash, complete 标志, TTL)
+  |                                |  del 的 info_hash 删除记录
+  |                                |  裁剪 TTL 到服务端最大值
+  |<<------------------------------|  {expires_at}
+  |                                |
+  |  (客户端在 session 期间定期重发 announce 刷新 TTL,
+  |   否则记录到期自动失效, peer 在查询结果中消失)
+```
+
+`add` 和 `del` 在一次请求里可以同时出现——先处理 `del` 再处理 `add`，避免"先 add 再 del 同一个"导致记录丢失。`complete` 是 `add` 子集的标记，不单独维护——只对 `add` 列表里的 info_hash 生效。
 
 ##### `GET /resources/{info_hash}/peers` — query
 
@@ -494,6 +607,38 @@ GET /sessions/challenge?peer_id=<peer_id>
 
 **授权与限制**：session `query`；限流、防枚举、不得返回 candidates 的公网地址或候选地址；候选数上限防放大。
 
+**交互流程**：
+
+```
+client                           Tracker
+  |                                |
+  |  GET /resources/{info_hash}/peers
+  |    ?limit=50&cursor=...        |
+  |  Authorization: Bearer <jwt>    |
+  |------------------------------>>|
+  |                                |  验 session JWT (scope 含 query?)
+  |                                |  检查限流 (按 peer_id + info_hash)
+  |                                |  查索引: info_hash → [peer_id 列表]
+  |                                |  按 limit 截取, 排除已下线/过期
+  |                                |  对每个候选 peer:
+  |                                |    生成一次性 connection_id (随机)
+  |                                |    记录 connection_id → (A, B, info_hash, ts)
+  |                                |    签发 connect JWT (scope=connect,
+  |                                |      sub=A, target_peer_id=B,
+  |                                |      info_hash, connection_id=jti,
+  |                                |      exp=数十秒)
+  |<<------------------------------|  {peers: [{peer_id, public_key,
+  |                                     punch_server, connect_jwt}, ...],
+  |                                    next_cursor}
+  |                                |
+  |  (客户端用 connect JWT 向 B 的 Punch Server 发起 signal)
+  |  (connect JWT 过期后需重新 query 获取新的)
+```
+
+**为什么 Tracker 签发 connect JWT 而不是直接返回 B 的地址**：Tracker 只做发现和授权，不做转发。A 拿到 connect JWT 后直接联系 B 所在的 Punch Server，Punch B 验 JWT 后才转发信令。这样 Tracker 不在数据路径上，也不持有 A/B 的网络地址。
+
+**为什么 connection_id = JWT 的 jti**：`jti`（JWT ID）是 JWT 规范里的一次性标识，Punch B 消费这个 jti 后就不再接受同一 jti 的请求——天然防重放。同时 Tracker 记录 `connection_id → (A, B, info_hash)` 作为后续 `relay_credentials` 的授权依据。
+
 ##### `POST /connections/{connection_id}/relay` — relay_credentials
 
 请求 TURN 中继凭据。携带 session JWT。
@@ -510,6 +655,37 @@ GET /sessions/challenge?peer_id=<peer_id>
 | `expires_at` | int64 | 凭据过期时间 |
 
 **授权与限制**：仅连接双方；按签发记录校验 `sub` 与 `connection_id` 记录，并检查配额。
+
+**交互流程**：
+
+```
+client (A)                      Tracker
+  |                                |
+  |  (直连 ICE 失败, 决定走 TURN)  |
+  |                                |
+  |  POST /connections/{connection_id}/relay
+  |  Authorization: Bearer <jwt>    |
+  |------------------------------>>|
+  |                                |  验 session JWT
+  |                                |  查 connection_id 记录:
+  |                                |    sub == A? 对端 == B?
+  |                                |    记录是否过期?
+  |                                |  检查 TURN 配额 (带宽/连接数/时长)
+  |                                |  生成短期 TURN REST 凭据:
+  |                                |    username = "expiry_timestamp:peer_id"
+  |                                |    password = HMAC(turn_secret, username)
+  |                                |  记录凭据发放 (用于计费/审计)
+  |<<------------------------------|  {turn_username, turn_password,
+  |                                    turn_servers, expires_at}
+  |                                |
+  |  (A 用凭据连接 TURN 服务器,
+  |   B 也会独立请求自己的 relay_credentials)
+  |  (TURN 凭据过期后需重新请求)
+```
+
+**为什么 A 和 B 各自请求**：TURN REST 凭据是 per-peer 的——用户名里编码了 peer_id，TURN 服务器按 peer_id 计费和限流。A 和 B 拿到的是各自的凭据，不是共享的。
+
+**为什么 Tracker 记录 connection_id**：`relay_credentials` 的授权依据是 Tracker 在 `query` 时签发的 `connection_id → (A, B, info_hash)` 记录。只有该记录里的双方才能请求 relay 凭据，防止第三方滥用。
 
 #### 7.2.2 Punch RPC 接口
 
@@ -535,6 +711,48 @@ Punch Server 上的接口走加密认证信道（非 REST），以 RPC 风格的
 
 **授权与限制**：JWT + 持钥证明；nonce 一次性消费；`peer_id` 未被吊销；新 binding 替换旧 binding。
 
+**交互流程**：
+
+```
+client (B)                     Punch Server (PB)
+  |                                |
+  |  (已通过 login 获得 punch JWT)  |
+  |  (已建立到 PB 的加密信道)       |
+  |                                |
+  |  punch.challenge(peer_id)      |
+  |------------------------------>>|
+  |                                |  生成 nonce
+  |                                |  存内存: nonce → (peer_id, 短过期)
+  |<<------------------------------|  {nonce, punch_id, expires_at}
+  |                                |
+  |  签名: sign(priv, "enter"      |
+  |    || nonce || punch_id || ts) |
+  |                                |
+  |  punch.enter(punch_jwt, nonce, |
+  |    punch_id, signature, ts)    |
+  |------------------------------>>|
+  |                                |  验 punch JWT (签名, aud, scope, exp)
+  |                                |    JWT 的 sub == peer_id?
+  |                                |  查 nonce 有效且属于该 peer_id
+  |                                |  查 peer_id 未被吊销 (查 Tracker 或缓存)
+  |                                |  取 public_key 验签
+  |                                |  删除 nonce (一次性)
+  |                                |  生成 binding_id (随机)
+  |                                |  生成 binding_key (随机 32 字节对称密钥)
+  |                                |  旧 binding (如有) 立即失效
+  |                                |  入库: binding_id → (peer_id, binding_key, TTL)
+  |<<------------------------------|  {binding_id, binding_key, expires_at}
+  |                                |
+  |  本地保存 binding_id + binding_key
+  |  (后续 heartbeat/leave 用 binding_key 做 HMAC, 不再签名)
+```
+
+`punch.challenge` 是 `punch.enter` 的前置步骤，获取 Punch Server 下发的 nonce。它与 login 的 challenge 机制同构——Punch Server 对客户端零先验，必须用随机数防重放。
+
+**为什么 enter 也要签名**：Punch Server 是独立服务，对客户端**零先验**。punch JWT 证明 Tracker 授权了这次接入，但 JWT 可能被偷。签名证明"持有 peer_id 对应的私钥"，把"JWT 持有者"和"私钥持有者"绑定。
+
+**为什么 enter 后改用 HMAC**：enter 时已经用非对称签名建立了 binding_key，后续 heartbeat 每隔几秒发一次（维持 NAT 映射），用对称 HMAC 比 Ed25519 签名快 10-50 倍，UDP 包也更小。binding_key 只在加密信道内传输，泄露面小。
+
 ##### `punch.heartbeat`
 
 刷新 Binding 与 NAT 映射。
@@ -552,6 +770,38 @@ Punch Server 上的接口走加密认证信道（非 REST），以 RPC 风格的
 
 **授权与限制**：有效 binding；校验 MAC、时钟窗口（±60s）和序列窗口（允许有限乱序）。
 
+**交互流程**：
+
+```
+client                       Punch Server
+  |                              |
+  |  (每隔 N 秒, 维持 NAT 映射)   |
+  |  seq = 上次 seq + 1          |
+  |  mac = HMAC(binding_key,     |
+  |    binding_id || seq ||      |
+  |    timestamp || generation)  |
+  |                              |
+  |  heartbeat(binding_id,       |
+  |    seq, timestamp, mac)       |
+  |  (走 UDP, 不需加密信道)       |
+  |---------------------------->>|
+  |                              |  查 binding_id 有效?
+  |                              |  校验 mac:
+  |                              |    重算 HMAC(binding_key, ...)
+  |                              |    比对
+  |                              |  校验 timestamp 在 ±60s 窗口内
+  |                              |  校验 seq > 上次接受的 seq
+  |                              |    (允许有限乱序窗口, 如 ±5)
+  |                              |  刷新 binding TTL
+  |<<----------------------------|  {expires_at}
+```
+
+**为什么用 HMAC 不用 JWT**：heartbeat 每隔几秒发一次（保活 + 刷新 NAT），用 JWT 每次验签成本高。HMAC 是对称运算，快 10-50 倍。binding_key 在 enter 时通过加密信道下发，只有客户端和 Punch Server 持有。
+
+**为什么走 UDP**：heartbeat 的目的是刷新 NAT 映射（让路由器保持端口转发），UDP 天然适合——不需要 TCP 的握手开销。UDP 不加密但 MAC 已防篡改和防重放。
+
+**为什么有 transport_generation**：ICE restart（网络切换）时 candidate 地址会变，generation 递增。MAC 覆盖 generation，防止旧 generation 的 heartbeat 被用来维持已失效的 NAT 映射。
+
 ##### `punch.leave`
 
 主动下线。
@@ -563,6 +813,34 @@ Punch Server 上的接口走加密认证信道（非 REST），以 RPC 风格的
 | `mac` | string | 同 heartbeat 的 MAC 算法 |
 
 **授权与限制**：有效 binding；校验 MAC 与序列号；成功后 binding 立即失效。
+
+**交互流程**：
+
+```
+client                       Punch Server
+  |                              |
+  |  (客户端主动下线)             |
+  |  seq = 当前 seq + 1          |
+  |  mac = HMAC(binding_key,     |
+  |    binding_id || seq ||      |
+  |    timestamp || generation)  |
+  |                              |
+  |  leave(binding_id,           |
+  |    seq, mac)                 |
+  |---------------------------->>|
+  |                              |  查 binding_id 有效?
+  |                              |  校验 mac + seq
+  |                              |  删除 binding 记录
+  |                              |  binding_key 立即作废
+  |<<----------------------------|  204 No Content
+  |                              |
+  |  (此后该 peer 的信令信道关闭,
+  |   其他 peer 无法再通过 PB 联系到它)
+```
+
+**为什么 leave 复用 heartbeat 的 MAC 机制**：客户端已经持有 binding_key，不需要新凭据。leave 和 heartbeat 用同样的 MAC 算法，Punch Server 用同样的校验逻辑，代码路径统一。
+
+**为什么不先 announce(del) 再 leave**：客户端下线时**应当**先通过 `announce` 的 `del` 撤下自己的全部资源（让 Tracker 停止把该 peer 作为查询候选返回），再 `leave` Punch Server。如果只 leave 不 del，Tracker 的资源索引要等 TTL 过期才消失，期间其他 peer query 到该 peer 后发起连接会失败。
 
 ##### `punch.signal`
 
@@ -584,6 +862,149 @@ Punch Server 上的接口走加密认证信道（非 REST），以 RPC 风格的
 | `error` | string? | 错误码（如 `peer_offline`、`rate_limited`、`invalid_jwt`） |
 
 **授权与限制**：offer 验证 connect JWT（`aud`、`scope`、`sub`、`target_peer_id`、`info_hash`、`connection_id`、`exp`）；answer/candidate/cancel 仅接受已登记连接的双方；SDP 对 Punch Server 不透明；A 断线重连凭 `connection_id` + `signal_key` 恢复。
+
+**交互流程（offer — A 发起连接）**：
+
+```
+A                        Punch B                      B
+  |                         |                          |
+  |  (已通过 query 获得对 B   |                          |
+  |   的 connect JWT)       |                          |
+  |  (本地已收集 ICE 候选)   |                          |
+  |                         |                          |
+  |  signal(type=offer,     |                          |
+  |    connection_id,        |                          |
+  |    connect_jwt,          |                          |
+  |    sdp=<A 的 SDP offer  |                          |
+  |      + DTLS 指纹         |                          |
+  |      + ICE 候选>)        |                          |
+  |------------------------>>|                          |
+  |                         |  验 connect JWT:          |
+  |                         |    签名, aud, scope,       |
+  |                         |    sub, target_peer_id,   |
+  |                         |    info_hash, connection_id,
+  |                         |    exp                   |
+  |                         |  原子登记 connection_id   |
+  |                         |    (一次性消费 jti)       |
+  |                         |  生成 signal_key (随机)   |
+  |                         |  存连接记录:               |
+  |                         |    connection_id →         |
+  |                         |      (A, B, info_hash,     |
+  |                         |       signal_key, ...)    |
+  |<<------------------------|  {signal_key, ok}         |
+  |                         |                          |
+  |                         |  转发 offer 给 B:         |
+  |                         |    signal(type=offer,     |
+  |                         |      connection_id,       |
+  |                         |      info_hash,           |
+  |                         |      A peer_id,           |
+  |                         |      A public_key,        |
+  |                         |      sdp)                 |
+  |                         |------------------------->>|
+  |                         |                          |  B 验签 connect JWT
+  |                         |                          |  B 校验 target_peer_id == self
+  |                         |                          |  B 校验 A 公钥与 peer_id 派生关系
+  |                         |                          |  B 决定接受/拒绝
+```
+
+**交互流程（answer — B 应答）**：
+
+```
+A                        Punch B                      B
+  |                         |                          |
+  |                         |  signal(type=answer,     |
+  |                         |    connection_id,        |
+  |                         |    sdp=<B 的 SDP answer  |
+  |                         |      + DTLS 指纹         |
+  |                         |      + ICE 候选>)         |
+  |                         |<<-------------------------|
+  |                         |                          |
+  |                         |  检查连接记录仍有效?      |
+  |                         |  检查 B 仍处于有效 binding?
+  |                         |  转发 answer 给 A:        |
+  |                         |    signal(type=answer,   |
+  |                         |      connection_id,     |
+  |                         |      B peer_id,         |
+  |                         |      sdp)               |
+  |<<------------------------|                          |
+  |                                                    |
+  |  A 验证 B 的 DTLS 证书指纹                          |
+  |    == SDP 中的指纹                                   |
+  |    == connect JWT 对应公钥的派生                     |
+```
+
+**交互流程（candidate — trickle ICE）**：
+
+```
+A 或 B              Punch B              对端
+  |                    |                   |
+  |  (ICE agent 发现   |                   |
+  |   新候选地址)      |                   |
+  |  signal(type=      |                   |
+  |    candidate,      |                   |
+  |    connection_id,  |                   |
+  |    candidate=      |                   |
+  |      "host:...")   |                   |
+  |------------------>>|                   |
+  |                    |  检查连接记录有效? |
+  |                    |  转发给对端:      |
+  |                    |    signal(type=   |
+  |                    |      candidate,  |
+  |                    |      connection_id,
+  |                    |      candidate)  |
+  |                    |------------------>|
+  |<<------------------|  {ok}            |
+```
+
+**交互流程（cancel — 取消连接）**：
+
+```
+A 或 B              Punch B              对端
+  |                    |                   |
+  |  (决定取消连接)    |                   |
+  |  signal(type=      |                   |
+  |    cancel,         |                   |
+  |    connection_id)  |                   |
+  |------------------>>|                   |
+  |                    |  删除连接记录      |
+  |                    |  停止转发          |
+  |                    |  向对端转发 cancel:|
+  |                    |    signal(type=   |
+  |                    |      cancel,      |
+  |                    |      connection_id)|
+  |                    |------------------>|
+  |                    |                   |
+  |                    |                   |  对端收到后立即
+  |                    |                   |  清理本地状态
+  |<<------------------|  {ok}            |
+```
+
+**交互流程（断线重连）**：
+
+```
+A                        Punch B
+  |                         |
+  |  (A 的瞬时信道断开)      |
+  |  (A 仍有 connection_id  |
+  |   和 signal_key)         |
+  |                         |
+  |  建立新加密信道          |
+  |  signal(type=offer,     |
+  |    connection_id,       |
+  |    signal_key)          |
+  |------------------------>>|
+  |                         |  查连接记录:               |
+  |                         |    connection_id 仍有效?    |
+  |                         |  校验 signal_key 匹配?      |
+  |                         |  恢复 A 的信道绑定         |
+  |<<------------------------|  补发未送达的信令           |
+  |  (通常是 answer 和       |  (按序, 送达或超时后丢弃)   |
+  |   少量 candidate)        |                            |
+```
+
+**为什么 offer 要带 connect JWT 而 answer 不用**：offer 是连接的**第一次**消息，Punch B 必须验证 A 有权发起连接（connect JWT 由 Tracker 签发，绑定 A/B/info_hash/connection_id）。一旦 connection_id 被原子登记（jti 一次性消费），后续 answer/candidate/cancel 只需凭 `connection_id` 匹配已登记的连接——信道即凭据。
+
+**为什么 signal_key 只在 offer 响应里下发一次**：signal_key 是对称密钥，用于断线重连时恢复信道。它在加密信道内传输，不暴露给网络。后续消息不再重复发送 signal_key，减少泄露面。
 
 ### 7.3 客户端函数面
 
