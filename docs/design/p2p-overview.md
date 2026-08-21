@@ -87,7 +87,7 @@ sequenceDiagram
     A->>PB: signal(type=offer, connection_id, SDP offer + A candidates, connect JWT)
     PB->>PB: 原子登记 connection_id（一次性）；验签与 claims 校验
     PB-->>A: 首个 signal 的响应（含 signal_key）
-    PB->>B: signal(type=offer, connection_id, info_hash, A peer_id、公钥、SDP offer + A candidates)
+    PB->>B: signal(type=offer, connection_id, info_hash, A peer_id, connect JWT, SDP offer + A candidates)
     B->>PB: signal(type=answer, connection_id, SDP answer + B candidates)
     PB->>PB: 检查 B 仍处于有效 Binding
     PB-->>A: signal(type=answer, connection_id, B peer_id, SDP answer + B candidates)
@@ -97,7 +97,7 @@ sequenceDiagram
     and
         B->>A: ICE checks + DTLS 握手
     end
-    Note over A,B: 身份锚定：对端 DTLS 证书指纹与信令中 SDP 一致；connect JWT 的 sub 与 offer 中公钥派生关系一致
+    Note over A,B: 身份锚定：对端 DTLS 证书指纹与信令中 SDP 一致；connect JWT 的 sub 与 sub_pub 派生关系一致
 
     alt 直连成功
         A<<->>B: DataChannel 建立（控制 reliable+ordered / 数据 unreliable+unordered）
@@ -218,7 +218,7 @@ Tracker 的查询结果仅包含 B 的 `peer_id`、B 的身份公钥、B 所在 
 
 ### 3.5 Punch 信令交换
 
-A 使用 `connect` JWT 中的 `connection_id`（即该 JWT 的一次性 `jti`，由 Tracker 生成、不可预测），并通过 `punch.signal` 发送 `type=offer`，其中包含自己的 SDP offer（含 DTLS 证书指纹与 ICE 用户名/口令）、候选地址与 `connect` JWT。Punch B 验证 `aud`、`scope`、`sub`、`target_peer_id`、`info_hash`、`connection_id`、`exp` 后，原子登记该 `connection_id`（即消费掉这个一次性 `jti`），并在该请求的响应中下发 `signal_key`（见下文），再向 B 转发该 offer（含 `info_hash`、`connection_id` 与 connect JWT 本体），使 B 能在应答前基于文件决定接受或拒绝，并能独立验签 JWT、校验 `target_peer_id` 与 offer 中 A 公钥的派生关系。B 再通过同一个 `punch.signal` 接口发送 `type=answer`，携带 SDP answer（含 B 的 DTLS 证书指纹）、最新候选与 `connection_id`；Punch B 仅在该记录仍有效且 B 处于有效 Binding 时将其转发给 A。
+A 使用 `connect` JWT 中的 `connection_id`（即该 JWT 的一次性 `jti`，由 Tracker 生成、不可预测），并通过 `punch.signal` 发送 `type=offer`，其中包含自己的 SDP offer（含 DTLS 证书指纹与 ICE 用户名/口令）、候选地址与 `connect` JWT。Punch B 验证 `aud`、`scope`、`sub`、`sub_pub`、`target_peer_id`、`info_hash`、`connection_id`、`exp` 后，原子登记该 `connection_id`（即消费掉这个一次性 `jti`），并在该请求的响应中下发 `signal_key`（见下文），再向 B 转发该 offer（含 `info_hash`、`connection_id` 与 connect JWT 本体），使 B 能在应答前基于文件决定接受或拒绝，并能独立验签 JWT、校验 `target_peer_id` 与 JWT 中 `sub_pub`（A 公钥）的派生关系。B 再通过同一个 `punch.signal` 接口发送 `type=answer`，携带 SDP answer（含 B 的 DTLS 证书指纹）、最新候选与 `connection_id`；Punch B 仅在该记录仍有效且 B 处于有效 Binding 时将其转发给 A。
 
 同一 `connection_id` 的连接记录有效期内，相同 offer 的重传**必须**幂等，并返回已有处理结果；不同内容复用同一 `connection_id` **必须**拒绝。若在连接建立超时前未收到 answer，A **应当**重新 `query` 获取新的 `connect` JWT 与新的 `connection_id` 发起新连接。`cancel` 会使 Punch B 删除该连接记录、停止转发，并向对端转发一条 `type=cancel`，对端收到后立即清理本地状态；未收到通知的一端仍**应当**在固定连接超时后清理记录。离线、令牌过期、目标拒绝、限流**应当**返回可区分的错误码，但对未授权请求不泄露目标是否在线。
 
@@ -241,7 +241,7 @@ B 一侧的信令送达依赖 B 与 Punch B 之间在 enter 时建立的常驻�
 拿到彼此 SDP 与候选地址后，ICE agent 自动完成连通性检查（同时向对方候选发包建立 NAT 映射、角色仲裁、提名），DTLS 在选中的路径上完成加密握手并建立 SCTP 关联。打洞与握手本身无需自行设计，需要设计的是**身份锚定**：
 
 - offer / answer 中的 DTLS 证书指纹经 Punch 认证信道送达（A 侧凭 connect JWT 建立的瞬时信道，B 侧凭 Binding 常驻信道）；连接建立时双方**必须**校验对端实际 DTLS 证书与信令中指纹一致，防止信令之后的路径替换。
-- B 侧**必须**校验 Punch 转发的 offer 所附 connect JWT（Tracker 验签、`target_peer_id` 为自己、`info_hash` 一致），并确认 offer 中的 A 公钥能派生出 JWT 的 `sub`；A 侧确认 answer 经 B 的有效 Binding 送达，且 Tracker 在 query 结果中返回的 B 公钥能派生出目标 `peer_id`。
+- B 侧**必须**校验 Punch 转发的 offer 所附 connect JWT（Tracker 验签、`target_peer_id` 为自己、`info_hash` 一致），并确认 JWT 中 `sub_pub`（A 公钥）能派生出 JWT 的 `sub`；A 侧确认 answer 经 B 的有效 Binding 送达，且 Tracker 在 query 结果中返回的 B 公钥能派生出目标 `peer_id`。
 
 连通性检查失败或超时按第 3.5 节的重试规则处理；candidate 失效或网络切换通过 ICE restart 恢复（对应 `transport_generation` 递增）。直连失败时进入第 4.7 节的 TURN 回退。
 
@@ -832,11 +832,10 @@ sequenceDiagram
     Note over PB: 存连接记录: connection_id → (A, B, info_hash, signal_key, ...)
     PB-->>A: {signal_key, ok}
 
-    PB->>B: signal(type=offer, connection_id, info_hash,<br/>A peer_id, A public_key, connect_jwt, sdp)
+    PB->>B: signal(type=offer, connection_id, info_hash,<br/>A peer_id, connect_jwt, sdp)
     Note over B: 验签 connect JWT (用 Tracker 公钥)
-    Note over B: 从 JWT 取 sub_pub, 校验 sub == SHA-256(sub_pub)
+    Note over B: 从 JWT 取 sub_pub (A 公钥), 校验 sub == SHA-256(sub_pub)
     Note over B: 校验 target_peer_id == self
-    Note over B: 校验 A 公钥与 peer_id 派生关系
     Note over B: 决定接受/拒绝
 ```
 
