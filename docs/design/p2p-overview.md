@@ -25,7 +25,7 @@
 
 **`peer_id`**：由客户端长期保存的 Ed25519 公钥派生的可读字符串，格式为 `peer:` + base32(SHA-256(public_key)) + bech32 校验位，约 58 字符，例如 `peer:ABCDEF234567...`。客户端本地生成密钥对、不由 Tracker 分配——密钥即身份，Tracker 只是发现与授权的控制面（密钥轮换即更换身份，见第 3.1 节）。base32 字母表为 RFC 4648（不含 `0/O/1/I` 以避免视觉混淆），bech32 校验位（BCH 码）可检测 4 位以内的转录错误。`peer_id` 同时用于协议消息、UI 显示、数据库主键——不再区分"二进制 ID"与"可读编码"。
 
-**Ed25519**：本设计全程使用 Ed25519 作为签名算法。选择理由：公钥仅 32 字节、签名 64 字节、验签速度比 RSA-2048 快 10–50 倍（对每次 `enter` 都要签名的移动端场景关键）、抗侧信道攻击。本设计**不**使用 RSA、ECDSA 或 GPG/OpenPGP 密钥格式——客户端自己生成并保存 Ed25519 密钥对，不依赖外部密钥管理工具。
+**Ed25519**：本设计全程使用 Ed25519 作为签名算法。选择理由：公钥仅 32 字节、签名 64 字节、验签速度比 RSA-2048 快 10–50 倍（对每次 `join` 都要签名的移动端场景关键）、抗侧信道攻击。本设计**不**使用 RSA、ECDSA 或 GPG/OpenPGP 密钥格式——客户端自己生成并保存 Ed25519 密钥对，不依赖外部密钥管理工具。
 
 ## 2. 系统总览
 
@@ -62,7 +62,7 @@ sequenceDiagram
         T-->>A: 注册确认
         A->>T: login(peer_id, nonce_signature)
         T-->>A: session JWT；punch JWT（aud=Punch A，scope=punch）；STUN/TURN 配置
-        A->>PA: enter(punch JWT, proof_of_possession)
+        A->>PA: join(punch JWT, proof_of_possession)
         PA-->>A: binding_id、binding_key、expires_at
         A->>STUN: Binding Request
         STUN-->>A: A candidates（host / srflx）
@@ -71,7 +71,7 @@ sequenceDiagram
         T-->>B: 注册确认
         B->>T: login(peer_id, nonce_signature)
         T-->>B: session JWT；punch JWT（aud=Punch B，scope=punch）；STUN/TURN 配置
-        B->>PB: enter(punch JWT, proof_of_possession)
+        B->>PB: join(punch JWT, proof_of_possession)
         PB-->>B: binding_id、binding_key、expires_at
         B->>STUN: Binding Request
         STUN-->>B: B candidates（host / srflx）
@@ -183,7 +183,7 @@ revocation_token = sign(private_key, "revoke" || peer_id || timestamp)
 revoke(peer_id, revocation_token)
 ```
 
-Tracker 验签后，将 `peer_id` 加入 `revoked` 列表（带吊销时间戳）。此后任何针对该 `peer_id` 的 `login` / `enter` 请求**必须**拒绝；Punch Server 在 `enter` 时**应当**通过 Tracker 的公开 API 校验 `peer_id` 是否被吊销（可短时间缓存以降低延迟），或依赖 session JWT 上的吊销标记。
+Tracker 验签后，将 `peer_id` 加入 `revoked` 列表（带吊销时间戳）。此后任何针对该 `peer_id` 的 `login` / `join` 请求**必须**拒绝；Punch Server 在 `join` 时**应当**通过 Tracker 的公开 API 校验 `peer_id` 是否被吊销（可短时间缓存以降低延迟），或依赖 session JWT 上的吊销标记。
 
 `revoked` 列表带 TTL（**应当**为 7 天，与 register TTL 解耦）。TTL 到期后 `peer_id` 可被重新注册——这平衡了"吊销有效性"与"peer_id 永久占用"。Token 丢失时只能等 register TTL 过期后重新注册（期间身份仍可被冒充，因此客户端**应当**妥善备份 token）。
 
@@ -196,13 +196,13 @@ Tracker 验签后，将 `peer_id` 加入 `revoked` 列表（带吊销时间戳�
 
 `peer_id` 本身就是可读字符串，无需额外编码或截断。用户复制粘贴、二维码扫描、搜索框输入都用同一个值。
 
-### 3.2 Binding：`enter`、`heartbeat` 与 `leave`
+### 3.2 Binding：`join`、`heartbeat` 与 `exit`
 
-客户端使用仅面向自身 Punch Server 的 `enter` JWT 建立 Binding，并使用 `peer_id` 对应私钥对本次请求的 nonce、`punch_id`、时间戳签名，证明令牌持有者确实控制该身份。单独的 bearer JWT **不得**作为 enter 的唯一凭据；nonce **必须**一次性消费（Punch Server 维护覆盖时间窗口两倍时长的去重记录），时间戳超出短窗口的请求**必须**拒绝，否则被截获的 enter 请求在 JWT 有效期内可被重放。Punch Server 验签并验证该证明后创建 `binding_id`，并通过该加密信道的已认证响应返回随机生成的会话级 `binding_key`。此 Binding 代表"该 peer 当前可通过这个 Punch Server 被联系到"。
+客户端使用仅面向自身 Punch Server 的 `punch JWT` 建立 Binding，并使用 `peer_id` 对应私钥对本次请求的 nonce、`punch_id`、时间戳签名，证明令牌持有者确实控制该身份。单独的 bearer JWT **不得**作为 join 的唯一凭据；nonce **必须**一次性消费（Punch Server 维护覆盖时间窗口两倍时长的去重记录），时间戳超出短窗口的请求**必须**拒绝，否则被截获的 join 请求在 JWT 有效期内可被重放。Punch Server 验签并验证该证明后创建 `binding_id`，并通过该加密信道的已认证响应返回随机生成的会话级 `binding_key`。此 Binding 代表"该 peer 当前可通过这个 Punch Server 被联系到"。
 
-之后的保活使用 `heartbeat(binding_id, seq, MAC)`，而不是每次发送完整 JWT。MAC 固定为 `HMAC-SHA-256(binding_key, binding_id || seq || timestamp || transport_generation)`；服务端仅接受递增序列号（允许一个有限乱序窗口）且 timestamp 在短窗口内的请求。Binding 到期、客户端重新 enter、或网络切换时，旧 `binding_key` 和旧序列号空间立即失效。这样既刷新 NAT 映射和在线 TTL，也避免频繁验签与较大的 UDP 包。
+之后的保活使用 `heartbeat(binding_id, seq, MAC)`，而不是每次发送完整 JWT。MAC 固定为 `HMAC-SHA-256(binding_key, binding_id || seq || timestamp || transport_generation)`；服务端仅接受递增序列号（允许一个有限乱序窗口）且 timestamp 在短窗口内的请求。Binding 到期、客户端重新 join、或网络切换时，旧 `binding_key` 和旧序列号空间立即失效。这样既刷新 NAT 映射和在线 TTL，也避免频繁验签与较大的 UDP 包。
 
-主动下线使用 `leave(binding_id, seq, MAC)`，复用 heartbeat 的 MAC 与序列号机制，无需新凭据；成功后 Binding 立即删除、`binding_key` 作废。客户端下线时**应当**先通过 `announce` 的 `del` 撤下自己的全部资源。Tracker 不提供 session 吊销：JWT 无状态，短 `exp` 已把泄露损失框在有限时间内，"下线"的语义由 `leave` 与资源撤下共同承担。
+主动下线使用 `exit(binding_id, seq, MAC)`，复用 heartbeat 的 MAC 与序列号机制，无需新凭据；成功后 Binding 立即删除、`binding_key` 作废。客户端下线时**应当**先通过 `announce` 的 `del` 撤下自己的全部资源。Tracker 不提供 session 吊销：JWT 无状态，短 `exp` 已把泄露损失框在有限时间内，"下线"的语义由 `exit` 与资源撤下共同承担。
 
 ### 3.3 ICE 候选收集
 
@@ -228,7 +228,7 @@ A 使用 `connect` JWT 中的 `connection_id`（即该 JWT 的一次性 `jti`，
 
 A 一侧的信令走**连接范围的瞬时加密信道**：随 A 的首个 `signal`（offer）建立，生命周期与 Punch B 上的连接记录一致（连接建立成功或超时即关闭），answer、trickle candidate、cancel 与错误都经它双向传递。首个 `signal` 以 connect JWT 认证；此后同一信道上的消息不再重复验证 JWT——信道即凭据，relay 回退阶段的 candidate 交换因此不受 JWT `exp` 限制。Punch B 在首个 `signal` 的响应中同时下发随机生成的 `signal_key`（对称密钥，只在加密信道内出现，有效期与连接记录一致）；这与 Binding 的模式同构：punch JWT 之于 `binding_key`，正如 connect JWT 之于 `signal_key`。若瞬时信道意外断开，A 重连 Punch B 并出示 `connection_id` 与 `signal_key` 即可恢复该连接的信令；Punch B 在连接记录中保留已收到但未送达 A 的信令（通常是 answer 与少量 candidate），重连后按序补发，送达或超时后丢弃。
 
-B 一侧的信令送达依赖 B 与 Punch B 之间在 enter 时建立的常驻加密信道：heartbeat 同时为该信道保活；信道断开即视为 Binding 失效，Punch Server 对后续连接请求返回可区分的"目标不可达"错误。两类信道的具体传输均不作限定，TCP+TLS、UDP+DTLS 或 QUIC 均可，硬性要求相同——机密性与完整性（`binding_key`、`signal_key` 与 connect JWT 均只经此类信道传输）、服务器认证（防止假 Punch Server 接管信令面）、以及网络切换后的可恢复性（常驻信道凭重新 enter 与 `transport_generation` 语义恢复，瞬时信道凭 `signal_key` 重连）。
+B 一侧的信令送达依赖 B 与 Punch B 之间在 join 时建立的常驻加密信道：heartbeat 同时为该信道保活；信道断开即视为 Binding 失效，Punch Server 对后续连接请求返回可区分的"目标不可达"错误。两类信道的具体传输均不作限定，TCP+TLS、UDP+DTLS 或 QUIC 均可，硬性要求相同——机密性与完整性（`binding_key`、`signal_key` 与 connect JWT 均只经此类信道传输）、服务器认证（防止假 Punch Server 接管信令面）、以及网络切换后的可恢复性（常驻信道凭重新 join 与 `transport_generation` 语义恢复，瞬时信道凭 `signal_key` 重连）。
 
 这也是部署前提：Punch Server 的容量需按两类连接估算——面向 B 的常驻 Binding 数（小时级），以及面向 A 的挂起瞬时信道数（数十秒级，受 connect JWT 有效期与连接超时共同框定），并对单个 peer/IP 的并发挂起信道数设上限，防止批量挂连接耗尽资源。
 
@@ -371,7 +371,7 @@ scheme 复用通用的 `magnet:`（BT 未发明专属 scheme，复用的正是 m
 
 Tracker API 基于 HTTPS REST：每个请求独立无状态，session JWT 通过 `Authorization: Bearer <jwt>` 头携带，请求/响应体使用 JSON 编码（`Content-Type: application/json`）。Tracker 不向客户端推送消息，两者之间不维护常驻信道——除 `register` 与 `revoke` 是一次性身份管理请求（不携带 session JWT）外，其余请求均携带 session JWT 按需调用。
 
-`punch.enter` / `punch.leave` / `punch.signal` 的请求响应控制面经加密认证信道传输（TCP+TLS、UDP+DTLS 或 QUIC 均可，客户端与 Punch Server 间的常驻与瞬时信令信道同此要求）；为维持 NAT 映射的 `punch.heartbeat` 可以使用 UDP，但**必须**遵循前述 MAC、时钟窗口和序列号校验。消息使用版本化 schema；未知必填字段、超出大小限制的 candidate 列表和不匹配的 `connection_id` 都**必须**拒绝。每个响应至少带协议版本、请求 ID 和明确的错误码。所有时钟校验（`nbf`/`exp`、heartbeat 的时间戳窗口）使用统一的服务端可配置容差（如 ±60 秒），客户端**应当**与可信时间源对时，容差需计入 nonce 去重窗口与序列号乱序窗口的计算。
+`punch.join` / `punch.exit` / `punch.signal` 的请求响应控制面经加密认证信道传输（TCP+TLS、UDP+DTLS 或 QUIC 均可，客户端与 Punch Server 间的常驻与瞬时信令信道同此要求）；为维持 NAT 映射的 `punch.heartbeat` 可以使用 UDP，但**必须**遵循前述 MAC、时钟窗口和序列号校验。消息使用版本化 schema；未知必填字段、超出大小限制的 candidate 列表和不匹配的 `connection_id` 都**必须**拒绝。每个响应至少带协议版本、请求 ID 和明确的错误码。所有时钟校验（`nbf`/`exp`、heartbeat 的时间戳窗口）使用统一的服务端可配置容差（如 ±60 秒），客户端**应当**与可信时间源对时，容差需计入 nonce 去重窗口与序列号乱序窗口的计算。
 
 ### 7.2 接口契约表
 
@@ -449,7 +449,7 @@ sequenceDiagram
     Note over T: 加入 revoked 列表 (TTL 7 天)
     Note over T: 标记该 peer_id 所有在途 session JWT 失效
     T-->>C: 204 No Content
-    Note over C,T: 攻击者即使持有旧私钥, 后续 login/enter 被拒绝
+    Note over C,T: 攻击者即使持有旧私钥, 后续 login/join 被拒绝
 ```
 
 revoke 不需要 nonce——`revocation_token` 是在 `register` 时就用私钥签好的静态声明（`sign(priv, "revoke" || peer_id || timestamp)`），一次签好后离线保存，泄露时提交即可。`timestamp` 在 token 生成时固定，Tracker 校验的是 token 签名而非时间窗口。
@@ -655,7 +655,7 @@ sequenceDiagram
 
 Punch Server 上的接口走加密认证信道（非 REST），以 RPC 风格的接口名 + 消息体交互。
 
-##### `punch.enter`
+##### `punch.join`
 
 建立 Binding。
 
@@ -664,7 +664,7 @@ Punch Server 上的接口走加密认证信道（非 REST），以 RPC 风格的
 | `punch_jwt` | string | 来自 login 的 punch JWT（`scope=punch`） |
 | `nonce` | string | Punch Server 下发的一次性随机数 |
 | `punch_id` | string | punch JWT 的 `aud` |
-| `signature` | string | `sign(private_key, "enter" \|\| nonce \|\| punch_id \|\| timestamp)` 的 base64 |
+| `signature` | string | `sign(private_key, "join" \|\| nonce \|\| punch_id \|\| timestamp)` 的 base64 |
 | `timestamp` | int64 | 请求时间戳 |
 
 | 响应字段 | 类型 | 说明 |
@@ -690,9 +690,9 @@ sequenceDiagram
     Note over PB: 存内存: nonce → (peer_id, 短过期)
     PB-->>B: {nonce, punch_id, expires_at}
 
-    Note over B: 签名: sign(priv, "enter" || nonce || punch_id || ts)
+    Note over B: 签名: sign(priv, "join" || nonce || punch_id || ts)
 
-    B->>PB: punch.enter(punch_jwt, nonce, punch_id, signature, ts)
+    B->>PB: punch.join(punch_jwt, nonce, punch_id, signature, ts)
     Note over PB: 验 punch JWT (签名, aud, scope, exp)<br/>JWT 的 sub == peer_id?
     Note over PB: 查 nonce 有效且属于该 peer_id
     Note over PB: 查 peer_id 未被吊销 (查 Tracker 或缓存)
@@ -707,11 +707,11 @@ sequenceDiagram
     Note over B: 本地保存 binding_id + binding_key<br/>后续 heartbeat/leave 用 binding_key 做 HMAC, 不再签名
 ```
 
-`punch.challenge` 是 `punch.enter` 的前置步骤，获取 Punch Server 下发的 nonce。它与 login 的 challenge 机制同构——Punch Server 对客户端零先验，必须用随机数防重放。
+`punch.challenge` 是 `punch.join` 的前置步骤，获取 Punch Server 下发的 nonce。它与 login 的 challenge 机制同构——Punch Server 对客户端零先验，必须用随机数防重放。
 
-**为什么 enter 也要签名**：Punch Server 是独立服务，对客户端**零先验**。punch JWT 证明 Tracker 授权了这次接入，但 JWT 可能被偷。签名证明"持有 peer_id 对应的私钥"，把"JWT 持有者"和"私钥持有者"绑定。
+**为什么 join 也要签名**：Punch Server 是独立服务，对客户端**零先验**。punch JWT 证明 Tracker 授权了这次接入，但 JWT 可能被偷。签名证明"持有 peer_id 对应的私钥"，把"JWT 持有者"和"私钥持有者"绑定。
 
-**为什么 enter 后改用 HMAC**：enter 时已经用非对称签名建立了 binding_key，后续 heartbeat 每隔几秒发一次（维持 NAT 映射），用对称 HMAC 比 Ed25519 签名快 10-50 倍，UDP 包也更小。binding_key 只在加密信道内传输，泄露面小。
+**为什么 join 后改用 HMAC**：join 时已经用非对称签名建立了 binding_key，后续 heartbeat 每隔几秒发一次（维持 NAT 映射），用对称 HMAC 比 Ed25519 签名快 10-50 倍，UDP 包也更小。binding_key 只在加密信道内传输，泄露面小。
 
 ##### `punch.heartbeat`
 
@@ -750,13 +750,13 @@ sequenceDiagram
     P-->>C: {expires_at}
 ```
 
-**为什么用 HMAC 不用 JWT**：heartbeat 每隔几秒发一次（保活 + 刷新 NAT），用 JWT 每次验签成本高。HMAC 是对称运算，快 10-50 倍。binding_key 在 enter 时通过加密信道下发，只有客户端和 Punch Server 持有。
+**为什么用 HMAC 不用 JWT**：heartbeat 每隔几秒发一次（保活 + 刷新 NAT），用 JWT 每次验签成本高。HMAC 是对称运算，快 10-50 倍。binding_key 在 join 时通过加密信道下发，只有客户端和 Punch Server 持有。
 
 **为什么走 UDP**：heartbeat 的目的是刷新 NAT 映射（让路由器保持端口转发），UDP 天然适合——不需要 TCP 的握手开销。UDP 不加密但 MAC 已防篡改和防重放。
 
 **为什么有 transport_generation**：ICE restart（网络切换）时 candidate 地址会变，generation 递增。MAC 覆盖 generation，防止旧 generation 的 heartbeat 被用来维持已失效的 NAT 映射。
 
-##### `punch.leave`
+##### `punch.exit`
 
 主动下线。
 
@@ -779,7 +779,7 @@ sequenceDiagram
     Note over C: seq = 当前 seq + 1
     Note over C: mac = HMAC(binding_key,<br/>binding_id || seq || timestamp || generation)
 
-    C->>P: leave(binding_id, seq, mac)
+    C->>P: exit(binding_id, seq, mac)
     Note over P: 查 binding_id 有效?
     Note over P: 校验 mac + seq
     Note over P: 删除 binding 记录
@@ -788,9 +788,9 @@ sequenceDiagram
     Note over C,P: 此后该 peer 的信令信道关闭<br/>其他 peer 无法再通过 PB 联系到它
 ```
 
-**为什么 leave 复用 heartbeat 的 MAC 机制**：客户端已经持有 binding_key，不需要新凭据。leave 和 heartbeat 用同样的 MAC 算法，Punch Server 用同样的校验逻辑，代码路径统一。
+**为什么 exit 复用 heartbeat 的 MAC 机制**：客户端已经持有 binding_key，不需要新凭据。exit 和 heartbeat 用同样的 MAC 算法，Punch Server 用同样的校验逻辑，代码路径统一。
 
-**为什么不先 announce(del) 再 leave**：客户端下线时**应当**先通过 `announce` 的 `del` 撤下自己的全部资源（让 Tracker 停止把该 peer 作为查询候选返回），再 `leave` Punch Server。如果只 leave 不 del，Tracker 的资源索引要等 TTL 过期才消失，期间其他 peer query 到该 peer 后发起连接会失败。
+**为什么不先 announce(del) 再 exit**：客户端下线时**应当**先通过 `announce` 的 `del` 撤下自己的全部资源（让 Tracker 停止把该 peer 作为查询候选返回），再 `exit` Punch Server。如果只 exit 不 del，Tracker 的资源索引要等 TTL 过期才消失，期间其他 peer query 到该 peer 后发起连接会失败。
 
 ##### `punch.signal`
 
@@ -933,8 +933,8 @@ sequenceDiagram
 
 | 函数 | 方向 | 说明 |
 | --- | --- | --- |
-| `SendEnterReq` / `OnEnterRsp` | A ↔ PA；B ↔ PB | `punch.enter`；rsp 含 `binding_id`、`binding_key` |
-| `SendLeaveReq` / `OnLeaveRsp` | A ↔ PA；B ↔ PB | `punch.leave` |
+| `SendJoinReq` / `OnJoinRsp` | A ↔ PA；B ↔ PB | `punch.join`；rsp 含 `binding_id`、`binding_key` |
+| `SendExitReq` / `OnExitRsp` | A ↔ PA；B ↔ PB | `punch.exit` |
 | `SendHeartbeatReq` / `OnHeartbeatRsp` | A ↔ PA；B ↔ PB | `punch.heartbeat`；rsp 含刷新后的过期时间 |
 | `SendSignalReq(offer)` | A → PB | 首个请求建立瞬时信令信道；承载 SDP offer；rsp 含 `signal_key` |
 | `SendSignalReq(answer)` | B → PB | 走 B 的常驻信道；承载 SDP answer |
