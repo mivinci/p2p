@@ -171,10 +171,10 @@ login(peer_id, nonce_signature)
 
 私钥泄露时，短 `exp` 只能把损失框在有限窗口内，无法立即止血。本设计引入 revocation token 机制：
 
-客户端在 `register` 时**必须**同时生成 revocation token，并离线保存：
+客户端在 `register` 时**必须**同时生成 revocation token，并离线保存。token 用客户端自己的 Ed25519 私钥签名（即 peer_id 对应的 private_key，Tracker 不持有此私钥）：
 
 ```
-revocation_token = sign(private_key, "revoke" || peer_id || timestamp)
+revocation_token = sign(client_private_key, "revoke" || peer_id || timestamp)
 ```
 
 客户端**应当**将此 token 导出为本地文件或托管到可信第三方。当私钥泄露或疑似泄露时，任何持有 token 的人可向 Tracker 提交：
@@ -183,7 +183,9 @@ revocation_token = sign(private_key, "revoke" || peer_id || timestamp)
 revoke(peer_id, revocation_token)
 ```
 
-Tracker 验签后，将 `peer_id` 加入 `revoked` 列表（带吊销时间戳）。此后任何针对该 `peer_id` 的 `login` / `join` 请求**必须**拒绝；Punch Server 在 `join` 时**应当**通过 Tracker 的公开 API 校验 `peer_id` 是否被吊销（可短时间缓存以降低延迟），或依赖 session JWT 上的吊销标记。
+Tracker 用 peer_id 对应的 public_key 验签 token（验证"这确实是私钥持有者授权的吊销"），验签通过后将 `peer_id` 加入 `revoked` 列表（带吊销时间戳）。此后任何针对该 `peer_id` 的 `login` / `join` 请求**必须**拒绝；Punch Server 在 `join` 时**应当**通过 Tracker 的公开 API 校验 `peer_id` 是否被吊销（可短时间缓存以降低延迟），或依赖 session JWT 上的吊销标记。
+
+**为什么 token 由客户端生成而非 Tracker**：Tracker 不持有客户端私钥，签不出 token。只有客户端能用私钥签，Tracker 只能验签。这保证了吊销权归用户所有——即使 Tracker 被攻破，攻击者拿到数据库也无法伪造吊销（没私钥签不出 token），只能阻止合法用户提交吊销（DoS，但无法冒充身份）。
 
 `revoked` 列表带 TTL（**应当**为 7 天，与 register TTL 解耦）。TTL 到期后 `peer_id` 可被重新注册——这平衡了"吊销有效性"与"peer_id 永久占用"。Token 丢失时只能等 register TTL 过期后重新注册（期间身份仍可被冒充，因此客户端**应当**妥善备份 token）。
 
