@@ -23,7 +23,7 @@
 - **STUN Server**：供 ICE 收集公网映射候选地址。
 - **TURN / Relay Server**：无法直连时经 ICE relay candidate 转发数据流。
 
-**`peer_id`**：由客户端长期保存的 Ed25519 公钥派生的可读字符串，格式为 `peer:` + base32(SHA-256(public_key)) + bech32 校验位，约 58 字符，例如 `peer:ABCDEF234567...`。客户端本地生成密钥对、不由 Tracker 分配——密钥即身份，Tracker 只是发现与授权的控制面（密钥轮换即更换身份，见第 3.1 节）。base32 字母表为 RFC 4648（不含 `0/O/1/I` 以避免视觉混淆），bech32 校验位（BCH 码）可检测 4 位以内的转录错误。`peer_id` 同时用于协议消息、UI 显示、数据库主键——不再区分"二进制 ID"与"可读编码"。
+**`peer_id`**：由客户端长期保存的 Ed25519 公钥派生的可读字符串，格式为 base32(SHA-256(public_key)) + bech32 校验位，约 53 字符，例如 `ABCDEF234567...`。客户端本地生成密钥对、不由 Tracker 分配——密钥即身份，Tracker 只是发现与授权的控制面（密钥轮换即更换身份，见第 3.1 节）。base32 字母表为 RFC 4648（不含 `0/O/1/I` 以避免视觉混淆），bech32 校验位（BCH 码）可检测 4 位以内的转录错误。`peer_id` 同时用于协议消息、UI 显示、数据库主键——不再区分"二进制 ID"与"可读编码"。
 
 **Ed25519**：本设计全程使用 Ed25519 作为签名算法。选择理由：公钥仅 32 字节、签名 64 字节、验签速度比 RSA-2048 快 10–50 倍（对每次 `join` 都要签名的移动端场景关键）、抗侧信道攻击。本设计**不**使用 RSA、ECDSA 或 GPG/OpenPGP 密钥格式——客户端自己生成并保存 Ed25519 密钥对，不依赖外部密钥管理工具。
 
@@ -387,7 +387,7 @@ Tracker API 基于 HTTPS REST：每个请求独立无状态，session JWT 通过
 
 | 请求字段 | 类型 | 说明 |
 | --- | --- | --- |
-| `peer_id` | string | `peer:` + base32(SHA-256(public_key)) + bech32 checksum |
+| `peer_id` | string | base32(SHA-256(public_key)) + bech32 checksum |
 | `public_key` | string | Ed25519 公钥的 base64 编码（32 字节解码后） |
 | `signature` | string | `sign(private_key, "register" \|\| peer_id \|\| public_key \|\| timestamp)` 的 base64 |
 | `timestamp` | int64 | 请求发起的 Unix 时间戳（秒），用于防重放 |
@@ -408,7 +408,7 @@ sequenceDiagram
     participant T as Tracker
 
     Note over C: 本地生成 Ed25519 密钥对
-    Note over C: 计算 peer_id = peer:base32(sha256(pub)) + checksum
+    Note over C: 计算 peer_id = base32(sha256(pub)) + checksum
     Note over C: 签名: sign(priv, "register" || peer_id || pub || ts)
     C->>T: POST /peers {peer_id, public_key, signature, timestamp}
     Note over T: 查注册表: peer_id 未注册或已过期?
@@ -498,7 +498,7 @@ sequenceDiagram
     participant C as client
     participant T as Tracker
 
-    C->>T: GET /sessions/challenge?peer_id=peer:ABCDEF...
+    C->>T: GET /sessions/challenge?peer_id=ABCDEF...
     Note over T: 查注册表取 public_key
     Note over T: 生成 32 字节随机 nonce
     Note over T: 存内存: nonce → (peer_id, 60s 过期)
