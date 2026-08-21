@@ -23,7 +23,11 @@
 - **STUN Server**：供 ICE 收集公网映射候选地址。
 - **TURN / Relay Server**：无法直连时经 ICE relay candidate 转发数据流。
 
-**`peer_id`**：由客户端长期保存的公钥派生，不由 Tracker 分配——密钥即身份，Tracker 只是发现与授权的控制面（密钥轮换即更换身份，见第 3.1 节）。
+**`peer_id`**：由客户端长期保存的 Ed25519 公钥派生（`SHA-256(public_key)`），32 字节，由客户端本地生成、不由 Tracker 分配——密钥即身份，Tracker 只是发现与授权的控制面（密钥轮换即更换身份，见第 3.1 节）。机器间协议始终使用二进制 `peer_id`。
+
+**`peer_fingerprint`**：`peer_id` 的可读编码，用于客户端 UI 显示、用户肉眼确认与手动输入场景。格式为 `p2p:` + base32(`peer_id` 前 12 字节) + bech32 校验位，分 5 组以连字符分隔，共 24 字符，例如 `p2p:ABCD2345-EFGH6789-JKL0-XXXX`。base32 字母表为 RFC 4648（不含 `0/O/1/I` 以避免视觉混淆），bech32 校验位（BCH 码）可检测 4 位以内的转录错误。fingerprint 仅作人机界面层编码，**不得**出现在协议消息中；两台设备上 fingerprint 一致即代表同一身份。
+
+**Ed25519**：本设计全程使用 Ed25519 作为签名算法。选择理由：公钥仅 32 字节、签名 64 字节、验签速度比 RSA-2048 快 10–50 倍（对每次 `enter` 都要签名的移动端场景关键）、抗侧信道攻击。本设计**不**使用 RSA、ECDSA 或 GPG/OpenPGP 密钥格式——客户端自己生成并保存 Ed25519 密钥对，不依赖外部密钥管理工具。
 
 ## 2. 系统总览
 
@@ -56,14 +60,18 @@ sequenceDiagram
     participant TURN as TURN / Relay Server
 
     par A 上线
-        A->>T: login(peer public key, signature)
+        A->>T: register(peer_id, public_key, signature)  [首次]
+        T-->>A: 注册确认
+        A->>T: login(peer_id, nonce_signature)
         T-->>A: session JWT；enter JWT（aud=Punch A，scope=enter）；STUN/TURN 配置
         A->>PA: enter(enter JWT, proof_of_possession)
         PA-->>A: binding_id、binding_key、expires_at
         A->>STUN: Binding Request
         STUN-->>A: A candidates（host / srflx）
     and B 上线并登记资源
-        B->>T: login(peer public key, signature)
+        B->>T: register(peer_id, public_key, signature)  [首次]
+        T-->>B: 注册确认
+        B->>T: login(peer_id, nonce_signature)
         T-->>B: session JWT；enter JWT（aud=Punch B，scope=enter）；STUN/TURN 配置
         B->>PB: enter(enter JWT, proof_of_possession)
         PB-->>B: binding_id、binding_key、expires_at
@@ -123,11 +131,73 @@ sequenceDiagram
 
 ### 3.1 登录与身份建立
 
-客户端携带公钥及对挑战或请求的签名登录 Tracker。Tracker 验证身份后，返回本次会话可使用的 JWT、分配的 Punch Server 地址，以及 STUN/TURN 配置。
+#### 3.1.1 密钥生成与注册
+
+客户端首次启动时本地生成 Ed25519 密钥对（私钥永不外传，**应当**以操作系统提供的密钥存储机制保管，如 macOS Keychain / Android Keystore / iOS Secure Enclave）。`peer_id` 由公钥派生：`peer_id = SHA-256(public_key)`（32 字节）。
+
+客户端向 Tracker 发起一次性的 `register` 请求，建立 `peer_id → public_key` 的全网唯一映射：
+
+```
+register(peer_id, public_key, signature, timestamp)
+  where signature = sign(private_key, "register" || peer_id || public_key || timestamp)
+```
+
+Tracker 验证三项后**必须**入库：
+
+1. `peer_id == SHA-256(public_key)` —— 防止伪造 `peer_id` 指向他人的公钥。
+2. `verify(public_key, signature)` —— 确认请求方确实持有对应私钥。
+3. `peer_id` 未被注册，或原注册记录已过期（见下文 TTL）。
+
+注册记录带 TTL（**应当**为 90 天，可配置），到期后 `peer_id` 可被重新注册。peer **必须**在 TTL 内 `login` 续期；续期时 Tracker **应当**刷新 TTL，连续活跃的 peer 无需重复 `register`。
+
+#### 3.1.2 登录
+
+`login` 是会话级认证，建立 Tracker 与 peer 之间的短期会话 JWT。客户端携带公钥及对挑战的签名登录：
+
+```
+login(peer_id, nonce_signature)
+  where nonce_signature = sign(private_key, "login" || peer_id || tracker_nonce || timestamp)
+```
+
+`tracker_nonce` 是 Tracker 先前下发的一次性随机数（登录页面或上一次 session 末尾下发），**必须**一次性消费。Tracker 查注册表取出 `public_key` 验签，验证通过后返回本次会话可使用的 JWT、分配的 Punch Server 地址，以及 STUN/TURN 配置。
+
+`login` 同时承担注册续期：成功 `login` 等同于刷新 `register` 的 TTL。
+
+#### 3.1.3 设计意图
 
 这样设计的目的，是让 `peer_id` 保持长期稳定，同时让短期访问权可过期、可轮换。Tracker 不是文件数据的中转站，而是身份、发现与授权控制面。
 
-`peer_id` 派生自公钥意味着密钥轮换即更换身份：客户端生成新密钥对、以新 `peer_id` 重新 login 并 announce，新旧身份短暂并存完成迁移。本设计不做密钥注册表或签名链——各层票据的短有效期（connect 数十秒、Binding 10–30 分钟、session 小时级）已把单把密钥泄露的损失框在有限时间内，复杂度不匹配收益。
+`peer_id` 派生自公钥意味着密钥轮换即更换身份：客户端生成新密钥对、以新 `peer_id` 重新 `register` + `login` 并 `announce`，新旧身份短暂并存完成迁移。本设计不做签名链——各层票据的短有效期（connect 数十秒、Binding 10–30 分钟、session 小时级）已把单把密钥泄露的损失框在有限时间内，复杂度不匹配收益。
+
+#### 3.1.4 密钥吊销（Revocation）
+
+私钥泄露时，短 `exp` 只能把损失框在有限窗口内，无法立即止血。本设计引入 revocation token 机制：
+
+客户端在 `register` 时**必须**同时生成 revocation token，并离线保存：
+
+```
+revocation_token = sign(private_key, "revoke" || peer_id || timestamp)
+```
+
+客户端**应当**将此 token 导出为本地文件或托管到可信第三方。当私钥泄露或疑似泄露时，任何持有 token 的人可向 Tracker 提交：
+
+```
+revoke(peer_id, revocation_token)
+```
+
+Tracker 验签后，将 `peer_id` 加入 `revoked` 列表（带吊销时间戳）。此后任何针对该 `peer_id` 的 `login` / `enter` 请求**必须**拒绝；Punch Server 在 `enter` 时**应当**通过 Tracker 的公开 API 校验 `peer_id` 是否被吊销（可短时间缓存以降低延迟），或依赖 session JWT 上的吊销标记。
+
+`revoked` 列表带 TTL（**应当**为 7 天，与 register TTL 解耦）。TTL 到期后 `peer_id` 可被重新注册——这平衡了"吊销有效性"与"peer_id 永久占用"。Token 丢失时只能等 register TTL 过期后重新注册（期间身份仍可被冒充，因此客户端**应当**妥善备份 token）。
+
+#### 3.1.5 客户端 UI 中的 fingerprint
+
+客户端 UI **应当**在"我的身份"页面同时显示：
+
+- `peer_fingerprint`（24 字符，分 5 组）：用于肉眼快速识别、添加好友、口耳相传确认
+- 完整 `peer_id`（32 字节 hex，折叠显示）：用于高级场景的诊断与日志检索
+- 二维码：编码 `peer_fingerprint`，方便线下扫码添加
+
+用户在两台设备上确认 fingerprint 一致即可确认是同一身份，无需比对完整 `peer_id`。**不得**在协议消息、日志或 URL 中使用 fingerprint——机器间始终用二进制 `peer_id`，fingerprint 仅在客户端 UI 层编码与解码。
 
 ### 3.2 Binding：`enter`、`heartbeat` 与 `leave`
 
@@ -310,11 +380,13 @@ Tracker API 与 `punch.enter` / `punch.leave` / `punch.signal` 的请求响应�
 
 | 接口 | 请求中的关键字段 | 成功响应 / 幂等规则 | 授权与限制 |
 | --- | --- | --- | --- |
-| `tracker.login` | 公钥、挑战签名 | session、enter JWT、服务配置 | 验证签名；对挑战一次性消费 |
+| `tracker.register` | `peer_id`、`public_key`、签名、时间戳 | 入库；同 `peer_id` 重复注册幂等返回 | 验证 `peer_id == SHA-256(public_key)` 与签名；未注册或已过期才允许；TTL 90 天 |
+| `tracker.revoke` | `peer_id`、`revocation_token` | 加入 `revoked` 列表；TTL 7 天 | 验证 token 签名；被吊销 `peer_id` 的所有后续请求拒绝 |
+| `tracker.login` | 公钥、挑战签名 | session、enter JWT、服务配置 | 验证签名；对挑战一次性消费；`peer_id` 未被吊销；同时刷新 register TTL |
 | `tracker.announce` | `add`/`del`、`info_hash` 集合、`complete`、TTL | 服务端裁剪后的过期时间；同一 peer/file 覆盖更新 | session `announce`；限制 TTL、批量大小、资源数和频率 |
 | `tracker.query` | `info_hash`、候选数 | 有上限的候选页及每个目标的 connect JWT | session `query`；限流、防枚举、不得返回 candidates |
 | `tracker.relay_credentials` | `connection_id` | 请求方自身的短期 TURN REST 凭据（或 `relay` JWT） | 仅连接双方；按签发记录校验 `sub` 与记录 TTL，并检查配额 |
-| `punch.enter` | enter JWT、持钥证明（nonce、`punch_id`、时间戳签名） | `binding_id`、`binding_key`、过期时间 | JWT + 持钥证明；nonce 一次性消费；新 binding 替换旧 binding |
+| `punch.enter` | enter JWT、持钥证明（nonce、`punch_id`、时间戳签名） | `binding_id`、`binding_key`、过期时间 | JWT + 持钥证明；nonce 一次性消费；`peer_id` 未被吊销；新 binding 替换旧 binding |
 | `punch.leave` | `binding_id`、seq、MAC | 确认下线；binding 立即失效 | 有效 binding；校验 MAC 与序列号 |
 | `punch.heartbeat` | `binding_id`、seq、timestamp、MAC | 刷新后的过期时间 | 有效 binding；校验 MAC、时钟窗口和序列窗口 |
 | `punch.signal` | type、`connection_id`、SDP / ICE candidate / 控制字段 | type 对应的转发确认/错误（首个 offer 的响应含 `signal_key`） | offer 验证 connect JWT；answer/candidate/cancel 仅接受已登记连接的双方；SDP 对 Punch Server 不透明；A 断线重连凭 `connection_id` + `signal_key` 恢复 |
@@ -323,10 +395,12 @@ Tracker API 与 `punch.enter` / `punch.leave` / `punch.signal` 的请求响应�
 
 #### 7.3.1 Tracker 通信接口
 
-客户端对 Tracker 的通信面只有**请求**与**响应**两类，没有 Relay——Tracker 不向客户端推送消息，两者之间也不维护常驻信道；除 `login` 外，各请求均携带 session JWT，在有效期内按需调用。
+客户端对 Tracker 的通信面只有**请求**与**响应**两类，没有 Relay——Tracker 不向客户端推送消息，两者之间也不维护常驻信道；`register` 与 `revoke` 是一次性的身份管理请求，不携带 session JWT；`login` 是会话级认证请求；其余请求均携带 session JWT，在有效期内按需调用。
 
 | 函数 | 方向 | 说明 |
 | --- | --- | --- |
+| `SendRegisterReq` / `OnRegisterRsp` | client ↔ Tracker | `tracker.register`；首次启动或密钥轮换时调用，一次性 |
+| `SendRevokeReq` / `OnRevokeRsp` | client → Tracker | `tracker.revoke`；私钥泄露时提交 revocation token，一次性 |
 | `SendLoginReq` / `OnLoginRsp` | client ↔ Tracker | `tracker.login`；rsp 含 session JWT、enter JWT、Punch Server 分配与 STUN/TURN 配置 |
 | `SendAnnounceReq` / `OnAnnounceRsp` | client ↔ Tracker | `tracker.announce`；`add` / `del` 批量登记与撤下资源 |
 | `SendQueryReq` / `OnQueryRsp` | client ↔ Tracker | `tracker.query`；rsp 含候选 Peer 的 `peer_id`、公钥、Punch 地址与 connect JWT |
@@ -380,6 +454,7 @@ Peer 之间的消息是对称、单向的，没有控制面那种请求-响应�
 - 只靠 `scope=connect`、却不校验 `aud` 与 `target_peer_id`：一张泄露票据可被拿去联系其他 Punch 节点或其他 Peer，权限范围过大。
 - 没有 `exp`、`jti`：截获的连接请求可在很久以后无限重放。
 - 没有独立的 TURN 授权与配额：攻击者可把 TURN 当开放代理消耗带宽，造成高额成本与滥用风险。
+- 没有密钥吊销机制：私钥泄露后，攻击者可在旧 session JWT 过期前持续冒充身份（最长数小时）。本设计通过 revocation token（第 3.1.4 节）解决，但要求客户端妥善备份 token；token 丢失时只能等 register TTL（默认 90 天）过期，期间身份仍可被冒充。
 
 ### 8.2 数据面
 
