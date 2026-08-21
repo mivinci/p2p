@@ -68,6 +68,9 @@ vcpkg_installed/
 Testing/
 .cache/
 
+# mdbook build output
+book/
+
 # AI
 .workbuddy
 .codebuddy
