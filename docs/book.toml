@@ -1,0 +1,21 @@
+[book]
+title = "p2p"
+description = "A P2P network."
+authors = ["mivinci"]
+language = "zh"
+src = "."
+
+[build]
+build-dir = "../book"
+
+[output.html]
+git-repository-url = "https://github.com/mivinci/p2p"
+edit-url-template = "https://github.com/mivinci/p2p/edit/main/docs/{path}"
+additional-js = ["mermaid.min.js", "mermaid-init.js"]
+
+[preprocessor.mermaid]
+command = "mdbook-mermaid"
+
+[output.html.fold]
+enable = true
+level = 1
