@@ -60,18 +60,18 @@ sequenceDiagram
     par A 上线
         A->>T: register(peer_id, public_key, signature)  [首次]
         T-->>A: 注册确认
-        A->>T: login(peer_id, nonce_signature)
+        A->>T: login(peer_id, nonce, signature)
         T-->>A: session JWT；punch JWT（aud=Punch A，scope=punch）；STUN/TURN 配置
-        A->>PA: join(punch JWT, signature)
+        A->>PA: join(punch JWT, public_key, signature)
         PA-->>A: binding_id、binding_key、expires_at
         A->>STUN: Binding Request
         STUN-->>A: A candidates（host / srflx）
     and B 上线并登记资源
         B->>T: register(peer_id, public_key, signature)  [首次]
         T-->>B: 注册确认
-        B->>T: login(peer_id, nonce_signature)
+        B->>T: login(peer_id, nonce, signature)
         T-->>B: session JWT；punch JWT（aud=Punch B，scope=punch）；STUN/TURN 配置
-        B->>PB: join(punch JWT, signature)
+        B->>PB: join(punch JWT, public_key, signature)
         PB-->>B: binding_id、binding_key、expires_at
         B->>STUN: Binding Request
         STUN-->>B: B candidates（host / srflx）
@@ -87,7 +87,7 @@ sequenceDiagram
     A->>PB: signal(type=offer, connection_id, SDP offer + A candidates, connect JWT)
     PB->>PB: 原子登记 connection_id（一次性）；验签与 claims 校验
     PB-->>A: 首个 signal 的响应（含 signal_key）
-    PB->>B: signal(type=offer, connection_id, info_hash, A peer_id, connect JWT, SDP offer + A candidates)
+    PB->>B: signal(type=offer, connection_id, info_hash, A peer_id, connect JWT, sdp)
     B->>PB: signal(type=answer, connection_id, SDP answer + B candidates)
     PB->>PB: 检查 B 仍处于有效 Binding
     PB-->>A: signal(type=answer, connection_id, B peer_id, SDP answer + B candidates)
@@ -97,7 +97,7 @@ sequenceDiagram
     and
         B->>A: ICE checks + DTLS 握手
     end
-    Note over A,B: 身份锚定：对端 DTLS 证书指纹与信令中 SDP 一致；connect JWT 的 sub 与 sub_pub 派生关系一致
+    Note over A,B: 身份锚定：对端 DTLS 证书指纹与信令中 SDP 一致；connect JWT 的 sub 由 Tracker 担保
 
     alt 直连成功
         A<<->>B: DataChannel 建立（控制 reliable+ordered / 数据 unreliable+unordered）
@@ -131,7 +131,7 @@ sequenceDiagram
 
 #### 3.1.1 密钥生成与注册
 
-客户端首次启动时本地生成 Ed25519 密钥对（私钥永不外传，**应当**以操作系统提供的密钥存储机制保管，如 macOS Keychain / Android Keystore / iOS Secure Enclave）。`peer_id` 由公钥派生：`peer_id = SHA-256(public_key)`（32 字节）。
+客户端首次启动时本地生成 Ed25519 密钥对（私钥永不外传，**应当**以操作系统提供的密钥存储机制保管，如 macOS Keychain / Android Keystore / iOS Secure Enclave）。`peer_id` 由公钥派生：`peer_id = base32(SHA-256(public_key)) + bech32_checksum`（见 1.3 节，约 53 字符的字符串）。
 
 客户端向 Tracker 发起一次性的 `register` 请求，建立 `peer_id → public_key` 的全网唯一映射：
 
@@ -142,7 +142,7 @@ register(peer_id, public_key, signature, timestamp)
 
 Tracker 验证三项后**必须**入库：
 
-1. `peer_id == SHA-256(public_key)` —— 防止伪造 `peer_id` 指向他人的公钥。
+1. `peer_id` 解码后的 32 字节 == `SHA-256(public_key)` —— 防止伪造 `peer_id` 指向他人的公钥。
 2. `verify(public_key, signature)` —— 确认请求方确实持有对应私钥。
 3. `peer_id` 未被注册，或原注册记录已过期（见下文 TTL）。
 
@@ -153,11 +153,11 @@ Tracker 验证三项后**必须**入库：
 `login` 是会话级认证，建立 Tracker 与 peer 之间的短期会话 JWT。客户端携带公钥及对挑战的签名登录：
 
 ```
-login(peer_id, nonce_signature)
-  where nonce_signature = sign(private_key, "login" || peer_id || tracker_nonce || timestamp)
+login(peer_id, nonce, signature, timestamp)
+  where signature = sign(private_key, "login" || peer_id || nonce || timestamp)
 ```
 
-`tracker_nonce` 是 Tracker 先前下发的一次性随机数（登录页面或上一次 session 末尾下发），**必须**一次性消费。Tracker 查注册表取出 `public_key` 验签，验证通过后返回本次会话可使用的 JWT、分配的 Punch Server 地址，以及 STUN/TURN 配置。
+`nonce` 是 Tracker 先前下发的一次性随机数（见 7.2.1 的 `GET /sessions/challenge`），**必须**一次性消费。Tracker 查注册表取出 `public_key` 验签，验证通过后返回本次会话可使用的 JWT、分配的 Punch Server 地址，以及 STUN/TURN 配置。
 
 `login` 同时承担注册续期：成功 `login` 等同于刷新 `register` 的 TTL。
 
@@ -183,7 +183,7 @@ revocation_token = sign(client_private_key, "revoke" || peer_id || timestamp)
 revoke(peer_id, revocation_token)
 ```
 
-Tracker 用 peer_id 对应的 public_key 验签 token（验证"这确实是私钥持有者授权的吊销"），验签通过后将 `peer_id` 加入 `revoked` 列表（带吊销时间戳）。此后任何针对该 `peer_id` 的 `login` / `join` 请求**必须**拒绝；Punch Server 在 `join` 时**应当**通过 Tracker 的公开 API 校验 `peer_id` 是否被吊销（可短时间缓存以降低延迟），或依赖 session JWT 上的吊销标记。
+Tracker 用 peer_id 对应的 public_key 验签 token（验证"这确实是私钥持有者授权的吊销"），验签通过后将 `peer_id` 加入 `revoked` 列表（带吊销时间戳）。此后任何针对该 `peer_id` 的 `login` / `join` 请求**必须**拒绝；Punch Server 在 `join` 时**应当**通过 Tracker 的公开 API 校验 `peer_id` 是否被吊销（可短时间缓存以降低延迟）。
 
 **为什么 token 由客户端生成而非 Tracker**：Tracker 不持有客户端私钥，签不出 token。只有客户端能用私钥签，Tracker 只能验签。这保证了吊销权归用户所有——即使 Tracker 被攻破，攻击者拿到数据库也无法伪造吊销（没私钥签不出 token），只能阻止合法用户提交吊销（DoS，但无法冒充身份）。
 
@@ -220,7 +220,7 @@ Tracker 的查询结果仅包含 B 的 `peer_id`、B 的身份公钥、B 所在 
 
 ### 3.5 Punch 信令交换
 
-A 使用 `connect` JWT 中的 `connection_id`（即该 JWT 的一次性 `jti`，由 Tracker 生成、不可预测），并通过 `punch.signal` 发送 `type=offer`，其中包含自己的 SDP offer（含 DTLS 证书指纹与 ICE 用户名/口令）、候选地址与 `connect` JWT。Punch B 验证 `aud`、`scope`、`sub`、`sub_pub`、`target_peer_id`、`info_hash`、`connection_id`、`exp` 后，原子登记该 `connection_id`（即消费掉这个一次性 `jti`），并在该请求的响应中下发 `signal_key`（见下文），再向 B 转发该 offer（含 `info_hash`、`connection_id` 与 connect JWT 本体），使 B 能在应答前基于文件决定接受或拒绝，并能独立验签 JWT、校验 `target_peer_id` 与 JWT 中 `sub_pub`（A 公钥）的派生关系。B 再通过同一个 `punch.signal` 接口发送 `type=answer`，携带 SDP answer（含 B 的 DTLS 证书指纹）、最新候选与 `connection_id`；Punch B 仅在该记录仍有效且 B 处于有效 Binding 时将其转发给 A。
+A 使用 `connect` JWT 中的 `connection_id`（即该 JWT 的一次性 `jti`，由 Tracker 生成、不可预测），并通过 `punch.signal` 发送 `type=offer`，其中包含自己的 SDP offer（含 DTLS 证书指纹与 ICE 用户名/口令）、候选地址与 `connect` JWT。Punch B 验证 `aud`、`scope`、`sub`、`target_peer_id`、`info_hash`、`connection_id`、`exp` 后，原子登记该 `connection_id`（即消费掉这个一次性 `jti`），并在该请求的响应中下发 `signal_key`（见下文），再向 B 转发该 offer（含 `info_hash`、`connection_id` 与 connect JWT 本体），使 B 能在应答前基于文件决定接受或拒绝，并能独立验签 JWT、校验 `target_peer_id`。B 再通过同一个 `punch.signal` 接口发送 `type=answer`，携带 SDP answer（含 B 的 DTLS 证书指纹）、最新候选与 `connection_id`；Punch B 仅在该记录仍有效且 B 处于有效 Binding 时将其转发给 A。
 
 同一 `connection_id` 的连接记录有效期内，相同 offer 的重传**必须**幂等，并返回已有处理结果；不同内容复用同一 `connection_id` **必须**拒绝。若在连接建立超时前未收到 answer，A **应当**重新 `query` 获取新的 `connect` JWT 与新的 `connection_id` 发起新连接。`cancel` 会使 Punch B 删除该连接记录、停止转发，并向对端转发一条 `type=cancel`，对端收到后立即清理本地状态；未收到通知的一端仍**应当**在固定连接超时后清理记录。离线、令牌过期、目标拒绝、限流**应当**返回可区分的错误码，但对未授权请求不泄露目标是否在线。
 
@@ -243,7 +243,7 @@ B 一侧的信令送达依赖 B 与 Punch B 之间在 join 时建立的常驻加
 拿到彼此 SDP 与候选地址后，ICE agent 自动完成连通性检查（同时向对方候选发包建立 NAT 映射、角色仲裁、提名），DTLS 在选中的路径上完成加密握手并建立 SCTP 关联。打洞与握手本身无需自行设计，需要设计的是**身份锚定**：
 
 - offer / answer 中的 DTLS 证书指纹经 Punch 认证信道送达（A 侧凭 connect JWT 建立的瞬时信道，B 侧凭 Binding 常驻信道）；连接建立时双方**必须**校验对端实际 DTLS 证书与信令中指纹一致，防止信令之后的路径替换。
-- B 侧**必须**校验 Punch 转发的 offer 所附 connect JWT（Tracker 验签、`target_peer_id` 为自己、`info_hash` 一致），并确认 JWT 中 `sub_pub`（A 公钥）能派生出 JWT 的 `sub`；A 侧确认 answer 经 B 的有效 Binding 送达，且 Tracker 在 query 结果中返回的 B 公钥能派生出目标 `peer_id`。
+- B 侧**必须**校验 Punch 转发的 offer 所附 connect JWT（Tracker 验签、`target_peer_id` 为自己、`info_hash` 一致）；A 侧确认 answer 经 B 的有效 Binding 送达，且 Tracker 在 query 结果中返回的 B 公钥能派生出目标 `peer_id`。
 
 连通性检查失败或超时按第 3.5 节的重试规则处理；candidate 失效或网络切换通过 ICE restart 恢复（对应 `transport_generation` 递增）。直连失败时进入第 4.7 节的 TURN 回退。
 
@@ -362,10 +362,12 @@ scheme 复用通用的 `magnet:`（BT 未发明专属 scheme，复用的正是 m
 | --- | --- | --- | --- | --- |
 | Tracker API 会话 | `tracker` | `query`、`announce` | `sub` | 分钟级至小时级 |
 | 建立/刷新 Punch Binding | 指定 `punch_id` | `punch` | `sub`、一次性 `jti` | 10–30 分钟 |
-| 请求连接目标 Peer | 指定 `punch_b_id` | `connect` | `sub`、`sub_pub`（发起方公钥）、`target_peer_id`、`info_hash`、`connection_id`（即一次性 `jti`） | 数十秒 |
+| 请求连接目标 Peer | 指定 `punch_b_id` | `connect` | `sub`、`target_peer_id`、`info_hash`、`connection_id`（即一次性 `jti`） | 数十秒 |
 | TURN 中继授权 | 指定 `turn_region_id` | `relay` | `connection_id`、对端 `peer_id`、带宽/连接数/时长配额（以 `relay` JWT 或 TURN REST username/HMAC 承载） | 分钟级 |
 
-每个服务**应当**至少校验：签名算法和签名、`iss`、`kid`、`aud`、`scope`、`sub`、`nbf`/`exp`；对于 `connect` JWT，还应校验 `target_peer_id`、`info_hash`、`sub_pub`（确认 `sub == SHA-256(sub_pub)` 即发起方公钥与身份一致），以及 `connection_id`（即 `jti`）的一次性消费语义；对于 `punch` JWT，应校验 `jti` 的一次性消费语义（每次 `punch.join` 消费一个 `jti`，重连需重新 login 获取新 punch JWT）。
+每个服务**应当**至少校验：签名算法和签名、`iss`、`kid`、`aud`、`scope`、`sub`、`nbf`/`exp`；对于 `connect` JWT，还应校验 `target_peer_id`、`info_hash`，以及 `connection_id`（即 `jti`）的一次性消费语义；对于 `punch` JWT，应校验 `jti` 的一次性消费语义（每次 `punch.join` 消费一个 `jti`，重连需重新 login 获取新 punch JWT）。
+
+JWT 不内嵌发起方公钥。`punch.join` 与 `tracker.register` 的请求体携带 `public_key`，验签前服务端**必须**先校验 `SHA-256(public_key) == JWT.sub`（或 register 的 `peer_id`）确认公钥与身份一致，再用此 `public_key` 验签 `signature`。
 
 ## 7. 接口契约与运行边界
 
@@ -400,7 +402,7 @@ Tracker API 基于 HTTPS REST：每个请求独立无状态，session JWT 通过
 | `registered_at` | int64 | 入库时间戳 |
 | `expires_at` | int64 | register TTL 到期时间（默认 90 天） |
 
-**授权与限制**：验证 `peer_id == SHA-256(public_key)` 与签名；`peer_id` 未被注册或已过期才允许；同 `peer_id` 重复注册幂等返回原记录。TTL 90 天（可配置）。
+**授权与限制**：验证 `peer_id` 解码后的 32 字节 == `SHA-256(public_key)` 与签名；`peer_id` 未被注册或已过期才允许；同 `peer_id` 重复注册幂等返回原记录。TTL 90 天（可配置）。
 
 **交互流程**：
 
@@ -414,12 +416,12 @@ sequenceDiagram
     Note over C: 签名: sign(priv, "register" || peer_id || pub || ts)
     C->>T: POST /peers {peer_id, public_key, signature, timestamp}
     Note over T: 查注册表: peer_id 未注册或已过期?
-    Note over T: 验证 peer_id == SHA-256(public_key)
+    Note over T: 验证 peer_id 解码后 == SHA-256(public_key)
     Note over T: 取 public_key 验签
     Note over T: 入库: peer_id → public_key, TTL 90 天
     T-->>C: 201 {registered_at, expires_at}
     Note over C: 本地保存私钥 (Keychain/Keystore)
-    Note over C: 本地生成并保存 revocation_token (见 revoke)
+    Note over C: 本地生成并保存 revocation_token (见 3.1.4 节)
 ```
 
 register 不需要 nonce，因为这是客户端**第一次**联系 Tracker，Tracker 对客户端一无所知，没有先验可以发 nonce。防重放靠 `timestamp` 窗口 + 同 `peer_id` 重复注册幂等返回。
@@ -585,7 +587,7 @@ sequenceDiagram
 | `peer_id` | string | 候选身份 |
 | `public_key` | string | Ed25519 公钥 base64 |
 | `punch_server` | string | 该 peer 所在 Punch Server 地址 |
-| `connect_jwt` | string | 一次连接所需的 connect JWT（`scope=connect`，`sub`、`sub_pub`（A 公钥）、`target_peer_id`、`info_hash`、`connection_id` 绑定） |
+| `connect_jwt` | string | 一次连接所需的 connect JWT（`scope=connect`，`sub`、`target_peer_id`、`info_hash`、`connection_id` 绑定） |
 
 **授权与限制**：session `query`；限流、防枚举、不得返回 candidates 的公网地址或候选地址；候选数上限防放大。
 
@@ -664,6 +666,7 @@ Punch Server 上的接口走加密认证信道（非 REST），以 RPC 风格的
 | 请求字段 | 类型 | 说明 |
 | --- | --- | --- |
 | `punch_jwt` | string | 来自 login 的 punch JWT（`scope=punch`，含一次性 `jti`） |
+| `public_key` | string | Ed25519 公钥的 base64 编码（32 字节解码后），由请求方自带 |
 | `signature` | string | `sign(private_key, "join" \|\| punch_jwt_raw \|\| timestamp)` 的 base64，其中 `punch_jwt_raw` 是 punch JWT 的完整序列化字符串 |
 | `timestamp` | int64 | 请求时间戳 |
 
@@ -687,11 +690,12 @@ sequenceDiagram
 
     Note over B: 签名: sign(priv, "join" || punch_jwt_raw || ts)
 
-    B->>PB: punch.join(punch_jwt, signature, ts)
+    B->>PB: punch.join(punch_jwt, public_key, signature, ts)
     Note over PB: 验 punch JWT (签名, aud, scope, exp)<br/>JWT 的 sub == peer_id?
     Note over PB: 查 jti 未被消费过
     Note over PB: 查 peer_id 未被吊销 (查 Tracker 或缓存)
-    Note over PB: 取 JWT 的 sub_pub (或从 sub 派生) 验签 signature
+    Note over PB: 校验 SHA-256(public_key) == JWT.sub (公钥与身份一致)
+    Note over PB: 用 public_key 验签 signature
     Note over PB: 标记 jti 已消费 (一次性)
     Note over PB: 生成 binding_id (随机)
     Note over PB: 生成 binding_key (随机 32 字节对称密钥)
@@ -806,7 +810,7 @@ sequenceDiagram
 | `ok` | bool | 转发确认 |
 | `error` | string? | 错误码（如 `peer_offline`、`rate_limited`、`invalid_jwt`） |
 
-**授权与限制**：offer 验证 connect JWT（`aud`、`scope`、`sub`、`sub_pub`、`target_peer_id`、`info_hash`、`connection_id`、`exp`）；answer/candidate/cancel 仅接受已登记连接的双方；SDP 对 Punch Server 不透明；A 断线重连凭 `connection_id` + `signal_key` 恢复。
+**授权与限制**：offer 验证 connect JWT（`aud`、`scope`、`sub`、`target_peer_id`、`info_hash`、`connection_id`、`exp`）；answer/candidate/cancel 仅接受已登记连接的双方；SDP 对 Punch Server 不透明；A 断线重连凭 `connection_id` + `signal_key` 恢复。
 
 **交互流程（offer — A 发起连接）**：
 
@@ -816,12 +820,10 @@ sequenceDiagram
     participant PB as Punch B
     participant B as client (B)
 
-    Note over A: 已通过 query 获得对 B 的 connect JWT<br/>(JWT claims 含 sub=A peer_id, sub_pub=A 公钥)
-    Note over A: 本地已收集 ICE 候选
+    Note over A: 已通过 query 获得对 B 的 connect JWT<br/>(JWT claims 含 sub=A peer_id, target_peer_id=B)
 
     A->>PB: signal(type=offer, connection_id, connect_jwt,<br/>sdp=A 的 SDP offer + DTLS 指纹 + ICE 候选)
     Note over PB: 验 connect JWT: 签名, aud, scope, sub,<br/>target_peer_id, info_hash, connection_id, exp
-    Note over PB: 从 JWT 取 sub_pub (A 公钥), 校验 sub == SHA-256(sub_pub)
     Note over PB: 原子登记 connection_id (一次性消费 jti)
     Note over PB: 生成 signal_key (随机)
     Note over PB: 存连接记录: connection_id → (A, B, info_hash, signal_key, ...)
@@ -829,12 +831,9 @@ sequenceDiagram
 
     PB->>B: signal(type=offer, connection_id, info_hash,<br/>A peer_id, connect_jwt, sdp)
     Note over B: 验签 connect JWT (用 Tracker 公钥)
-    Note over B: 从 JWT 取 sub_pub (A 公钥), 校验 sub == SHA-256(sub_pub)
     Note over B: 校验 target_peer_id == self
     Note over B: 决定接受/拒绝
 ```
-
-**Punch B 怎么知道 A 的公钥**：A 的公钥由 Tracker 签发 connect JWT 时放入 `sub_pub` claim。Punch B 验 JWT 后从 payload 取出 `sub_pub`，校验 `sub == SHA-256(sub_pub)` 确认公钥与身份一致，再转发给 B。B 同样从 JWT 取 `sub_pub` 并独立校验。这样 A 不需要在 signal 请求里额外携带公钥——公钥的权威性由 Tracker 签名保证。
 
 **交互流程（answer — B 应答）**：
 
