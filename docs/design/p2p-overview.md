@@ -968,7 +968,7 @@ Peer 之间的消息是对称、单向的，没有控制面那种请求-响应�
 - 只靠 `scope=connect`、却不校验 `aud` 与 `target_peer_id`：一张泄露票据可被拿去联系其他 Punch 节点或其他 Peer，权限范围过大。
 - 没有 `exp`、`jti`：截获的连接请求可在很久以后无限重放。
 - 没有独立的 TURN 授权与配额：攻击者可把 TURN 当开放代理消耗带宽，造成高额成本与滥用风险。
-- 没有密钥吊销机制：私钥泄露后，攻击者可在旧 session JWT 过期前持续冒充身份（最长数小时）。本设计通过 revocation token（第 3.1.4 节）解决，但要求客户端妥善备份 token；token 丢失时只能等 register TTL（默认 90 天）过期，期间身份仍可被冒充。
+- 没有密钥吊销机制：私钥泄露后，攻击者持有私钥即可持续 login 获取新 session JWT，短 `exp` 只能限制单次会话窗口，无法阻止冒充。本设计通过 revocation token（第 3.1.4 节）解决——撤销的是 peer_id 本身（从 Tracker 注册表标记为吊销），此后该 peer_id 的 login / join 全部拒绝，攻击者即使持有私钥也无法重新获取 session JWT。要求客户端妥善备份 token；token 丢失时只能等 register TTL（默认 90 天）过期，期间身份仍可被冒充。
 
 ### 8.2 数据面
 
