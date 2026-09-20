@@ -4,7 +4,7 @@
 | --- | --- |
 | 设计稿（Experimental） | 2026-09-20 |
 
-> 变更摘要：2026-09-20 起数据面改为 Merkle 证明校验（`info` 的 `hashes` 列表 → `root`，`v: 1` → `v: 2`），新增 `request_proof` / `proof` / `pause` / `resume` 消息与 CDN 的 `proof_list` 配套源。
+> 变更摘要：2026-09-20 起数据面改为 Merkle 证明校验（`info` 的 `hashes` 列表 → `root`，`v: 1` → `v: 2`），新增 `request_proof` / `proof` / `pause` / `resume` 消息与叶子哈希列表的两种来源（envelope 内联 `leaf_hashes`、`proof_list` URL）。证明走可靠控制通道、先于数据到达，载荷默认含叶子哈希以便缓存复用（对齐 BEP 52 的 `base layer = 0`）。
 
 ## 1. 引言
 
@@ -109,17 +109,16 @@ sequenceDiagram
         end
         A->>B: bitfield（verified block 位图，为空可跳过）
         B->>A: bitfield
-        opt 顺序窗口（可选优化，见 4.6 节）
+        opt 缺证明时（顺序窗口推荐预取，见 4.6 节）
             A->>B: request_proof(first_block_index, count)
-            B-->>A: proof（批量 pruned subtree，覆盖 count 个连续 block）
+            B-->>A: proof（叶子哈希段 + 上层节点，走控制通道，先于数据）
         end
         loop 下载循环（顺序窗口 / rarest first 选 block，pipelining 维持在途请求）
             A->>B: request(block_index, piece_offset, length)
             B-->>A: chunk × N（1024 B/条，走数据通道）或 reject（含 retry_after）
-            Note over B,A: block 的最后一个 chunk 捎带该 block 的 Merkle 证明
             A->>B: chunk_nack（缺失 chunk）或 piece_done（收齐）
         end
-        Note over A,B: block 集齐 → Merkle 证明校验（对上 info.root）→ verified → 广播 have；证明无效或 root 不匹配 → 回 partial 重下并计失败
+        Note over A,B: block 集齐 → 用已缓存的叶子哈希查表（或证明校验）对上 info.root → verified → 广播 have；不匹配 → 回 partial 重下并计失败
     else 直连失败
         Note over T: 验 connect JWT 本体（签名 + sub/target + info_hash + grace_until）
         A->>T: relay_credentials(connect_jwt)
@@ -289,7 +288,7 @@ B 一侧的信令送达依赖 B 与 Punch B 之间在 join 时建立的常驻加
 
 数据组织分为两个粒度，分别服务校验成本与传输流水线：
 
-- **block：校验单位。** 每个 block 是 Merkle 树的一片叶子，info 只携带树根 `root`（32 字节，格式见第 5 节），逐 block 校验靠 Merkle 证明（见 4.2.1 节）——因此 info 的体积与文件大小无关。BitTorrent v1 的 pieces 与 v2 的 piece layers 同为全量哈希列表，本设计不做全量列表；注意命名相反——BT 称该哈希单位为 piece，其 wire 消息 `piece` 装载的却是本设计的 piece，本设计的命名与 BT wire 层一致。block 大小**必须**是 piece 大小的整数倍，2 的幂、256 KiB–4 MiB（默认 256 KiB），最后一个 block 可以短于标准大小。客户端只对集齐全部 piece 的 block 做校验；校验通过才进入 verified 状态，也只有 verified 的 block 可以响应他人的请求。单个 piece 损坏最多作废一个 block，端到端校验使恶意 Peer 无法污染数据。
+- **block：校验单位。** 每个 block 是 Merkle 树的一片叶子，info 只携带树根 `root`（32 字节，格式见第 5 节），逐 block 校验靠 Merkle 证明（见 4.2.1 节）——因此 info 的体积与文件大小无关。BT v1 把全量哈希列表放在 info 内（`pieces`），v2 把它移到 info 之外（`piece layers`）；本设计同样**不**把它放进 info——全量列表**可以**内联在 envelope 的 `leaf_hashes`（不参与 `info_hash`），也可以按需从 Peer 或 `proof_list` 取得（见 5.1 节）。注意命名相反——BT 称该哈希单位为 piece，其 wire 消息 `piece` 装载的却是本设计的 piece，本设计的命名与 BT wire 层一致。block 大小**必须**是 piece 大小的整数倍，2 的幂、256 KiB–4 MiB（默认 256 KiB），最后一个 block 可以短于标准大小。客户端只对集齐全部 piece 的 block 做校验；校验通过才进入 verified 状态，也只有 verified 的 block 可以响应他人的请求。单个 piece 损坏最多作废一个 block，端到端校验使恶意 Peer 无法污染数据。
 - **piece：请求与调度单位。** 固定 16 KiB（2^14 字节），文件末尾的 piece 可以短。请求、重传与取消都以 piece 为粒度；不对单个 piece 做校验。
 - **chunk：传输单位。** 固定 1024 字节（2^10 字节），文件末尾的 chunk 可以短。piece 在发送前拆成 chunk，每条 chunk 作为一条独立的数据通道消息；丢失时只重传缺失的 chunk（理由见 4.5 节）。chunk 是传输层概念，不出现在请求语义中。
 
@@ -327,7 +326,17 @@ n = 1 时，root = leaf(0)
 
 单个 block 的证明长度为 `≤ ceil(log2 n)` 项（n = 8192 时 13 个哈希 = 416 字节）。
 
-**批量证明（pruned subtree）**：连续区间 `[i, i+m)` 的证明只需提供沿区间边界向上的兄弟节点——每层边界最多各一个，因此大小上界约为 `2 × ceil(log2 n) + 2`，与区间长度**无关**。n = 8192 时覆盖 64 个连续 block 约需 28 个哈希（896 字节），而 64 份独立证明需 832 个哈希（26.6 KB）。顺序窗口场景下这个优化很自然（见 4.6 节），也是控制面流量受约束（4.5 节）时的主要缓解手段。
+**批量证明（pruned subtree）**：连续区间 `[i, i+m)` 的证明只需提供沿区间边界向上的兄弟节点——每层边界最多各一个，因此上层节点数与区间长度**无关**（上界约 `2 × ceil(log2 n) + 2`）。n = 8192、m = 64 时上层节点约 224 字节，而 64 份独立证明需 832 个哈希（26.6 KB）。顺序窗口场景下这个优化很自然（见 4.6 节），也是控制面流量受约束（4.5 节）时的主要缓解手段。
+
+**证明的载荷默认包含叶子哈希**（对齐 BEP 52 的 `base layer = 0`）：`proof` 除了上层节点，还**应当**携带所覆盖 block 的**叶子哈希本身**。这样下载方拿到的是一份"数据承诺"而不是单纯的验证路径：
+
+- 校验一次后即可**缓存**，该区间内后续 block 的校验退化为 O(1) 查表，不必逐块重放路径；
+- 缓存可持久化，重连与重启后不必重新拉取；
+- 与 CDN 兜底路径（5.1 节的 `leaf_hashes` / `proof_list`）共用**同一套**"取列表 → 本地建树 → 重建 root → 比对"的代码。
+
+代价是载荷多出 `m × 32` 字节（m = 64 时 2 KB），摊到 64 × 256 KiB = 16 MB 数据上是 0.01% 量级——不值得为省这点带宽放弃可缓存性。上传方**可以**在区间很短、通道质量好时省略叶子哈希（只给上层节点），此时下载方按纯验证路径校验。
+
+**证明必须先于（或平行于）数据到达，且必须走可靠通道**：校验依赖证明，而数据是 unreliable 传输的——把唯一一份证明搭在数据通道的最后一条 chunk 上，等于让它承受最高的丢包概率，一旦丢失整块数据都无法校验。因此证明**必须**走可靠的控制通道（4.5 节），由上传方主动推送或响应 `request_proof`；这与 BEP 52 把 `hashes` 与 `piece` 分成两条独立消息是同一个理由。
 
 **上传方不必存储整棵树**：本地保留一份完整的叶子哈希列表作缓存（n × 32 字节；8192 个 block 为 256 KB），证明在响应请求时现算即可——树的形态完全由 `n` 与 block 数据决定，无需落盘。CDN 兜底路径的证明来源见 5.1 节。
 
@@ -350,7 +359,7 @@ n = 1 时，root = leaf(0)
 每个连接开两条 DataChannel：
 
 - **控制通道**：reliable + ordered，承载 `bitfield`、`have`、`request`、`reject`、`pause`、`resume`、`request_proof`、`proof`、`chunk_nack`、`piece_done`、`cancel`、`request_info`、`info`；
-- **数据通道**：unreliable + unordered（`maxRetransmits = 0`），只承载 `chunk`（block 的最后一个 chunk **可以**捎带该 block 的 Merkle 证明）。
+- **数据通道**：unreliable + unordered（`maxRetransmits = 0`），只承载 `chunk`。Merkle 证明**不得**以数据通道为唯一来源（理由见 4.2.1 节与下文 `chunk`）。
 
 **为什么数据面必须走 chunk 而不是直接发整个 piece**：SCTP 会把大于路径 MTU 的消息切成多个 DATA chunk 分别发送，而 `maxRetransmits = 0` 是**消息级**的部分可靠——任何一个 DATA chunk 丢失，整条消息作废，已发出的其余字节全部浪费。WebRTC 下 PMTU 约 1200 字节，一条 16 KiB 的消息被切成约 15 个 DATA chunk，于是：
 
@@ -363,20 +372,20 @@ n = 1 时，root = leaf(0)
 DataChannel 是消息语义（SCTP message），每条协议消息即一个消息，无需自定义长度前缀帧。请求与取消以 piece 为粒度，传输以 chunk 为粒度：
 
 - `request(block_index, piece_offset, length)`：`length` ≤ 16 KiB。同一连接维持固定数量的在途请求（pipelining，典型 4–8 个 piece），使吞吐不受 RTT 限制；在途请求由发送方跟踪，超时未响应即重新 `request` 或转向其他 Peer。
-- `chunk(block_index, piece_offset, chunk_offset, data[, proof])`：`request` 的数据响应分支，走数据通道，`data` ≤ 1024 字节。接收方按 `chunk_offset` 写入并更新该 piece 的 chunk 位图。当该 chunk 是一个 block 的**最后一个** chunk 时，上传方**应当**在 `proof` 字段捎带该 block 的 Merkle 证明（格式见 4.2.1 节）——这取代了独立往返，是默认的证明传递方式。捎带时该消息允许超过 1024 字节，但仍**应当**控制在双倍路径 MTU（约 2400 字节）以内：n = 8192 时证明为 13 × 32 = 416 字节，整条消息约 1.5 KB，SCTP 切成 2 个 DATA chunk，丢失概率 `(1−p)²`，可接受。
+- `chunk(block_index, piece_offset, chunk_offset, data[, proof])`：`request` 的数据响应分支，走数据通道，`data` ≤ 1024 字节。接收方按 `chunk_offset` 写入并更新该 piece 的 chunk 位图。`proof` 字段是**可选的冗余**：上传方**可以**在 block 的最后一个 chunk 上捎带证明以省一条控制消息，但**不得**把它当作唯一来源——数据通道不可靠，证明丢包会让整块数据无法校验，只能等重传。下载方**不得**依赖捎带，仍**必须**能通过 `request_proof` 取到证明。捎带时该消息允许超过 1024 字节，但仍**应当**控制在双倍路径 MTU（约 2400 字节）以内。
 - `chunk_nack(block_index, piece_offset, chunk_offset[], length[])`：接收方在一个 piece 级超时（`PIECE_TIMEOUT`，建议 `2 × RTT + 100 ms`，按实测 RTT 自适应）后批量请求重传缺失的 chunk。连续 3 次仍未收齐即判定对端为慢 Peer，转投其他 Peer。
 - `piece_done(block_index, piece_offset)`：接收方收齐后确认，上传方释放缓冲；未收到确认时上传方**应当**在 piece 级超时后自行释放。
 - `reject(block_index, piece_offset, length[, retry_after])`：`request` 的另一响应分支，上传方即时、按单个请求粒度拒绝（带宽不足、调度优先级低、请求不合法）。**应当**携带 `retry_after`（毫秒）给出建议退避时长；下载方**必须**遵守，默认策略为指数退避（100 ms 起、上限 5 s），连续多次被拒后转投其他 Peer。
-- `pause(retry_after[, scope])` / `resume([scope])`：上传方对**连接粒度**的服务意愿开关，语义等价于 BitTorrent 的 choke / unchoke 但**不绑定** tit-for-tat——上传方完全按本地策略决定。`scope` 取 `this`（默认，只对接收方）或 `all`；连接建立时默认为 resume。下载方收到 `pause` 后**必须**停止发起新 `request`，在 `retry_after`（毫秒）之后或收到 `resume` 后恢复。这是"100 个 Peer 同时请求即 100 条 reject/轮"的兜底：没有它，上传方无法一次性表达"我现在谁也不服务"，控制通道会被 reject 淹没。
-- `request_proof(first_block_index, count)`：下载方预取 `[first_block_index, first_block_index + count)` 这段连续 block 的**批量**证明（pruned subtree）。顺序窗口场景**应当**在进入新窗口前预取一次，摊薄控制面流量。
-- `proof(first_block_index, count, nodes[])`：`request_proof` 的响应，也可由上传方主动推送。`nodes` 为 `(level, index, hash)` 列表（4.2.1 节）。已预取覆盖的 block，其最后一个 chunk **可以**省略 `proof` 字段。
+- `pause(retry_after[, scope])` / `resume([scope])`：上传方对**连接粒度**的服务意愿开关，语义等价于 BitTorrent 的 choke / unchoke 但**不绑定** tit-for-tat——上传方完全按本地策略决定。`scope` 取 `this`（默认，只对接收方）或 `all`；连接建立时默认为 resume。下载方收到 `pause` 后**必须**停止发起新 `request`，在 `retry_after`（毫秒）之后或收到 `resume` 后恢复。这是"100 个 Peer 同时请求即 100 条 reject/轮"的兜底：没有它，上传方无法一次性表达"我现在谁也不服务"，控制通道会被 reject 淹没。**`pause` 只约束 `request`，不约束 `request_proof`**——已收到但缺证明的数据必须能补到证明，否则既无法校验也无法释放缓冲（对应 BEP 52："hash request 不受 choke 限制"）。
+- `request_proof(first_block_index, count)`：下载方请求 `[first_block_index, first_block_index + count)` 这段 block 的证明。走控制通道（`reliable`），**不受 `pause` 限制**。顺序窗口场景**应当**在进入新窗口前预取一次，摊薄控制面流量。
+- `proof(first_block_index, count, leaf_hashes[], nodes[])`：`request_proof` 的响应，也可由上传方在发出相应数据**之前主动推送**（推荐：省一个往返，且保证证明先于数据到达）。`leaf_hashes` 为该区间的叶子哈希（按 index 顺序，4.2.1 节），`nodes` 为其余必要的上层节点 `(level, index, hash)`。
 - `cancel(block_index, piece_offset, length)`：撤销尚在途的请求；未发出的 chunk 不再发送。
 
-上传方**必须**让下载方能校验每一个自己发出的 block，两种方式任选其一：捎带在最后一个 chunk（默认），或响应 `request_proof` 下发批量证明。两者都没有 → 下载方**不得**将该 block 置为 verified，并在超时后转投其他 Peer；收到无效证明（重建结果 ≠ `info.root`）时同样按"提供错误数据"计一次失败。
+上传方**必须**让下载方能校验每一个自己发出的 block，且**证明必须先于或平行于数据到达**——推荐顺序是响应 `request` 时先发 `proof` 再发 chunk。**上传方在已服务某个 block 的数据后，不得拒绝提供该 block 的证明**（对应 BEP 52 对 `hash request` 的同一约束）：否则下载方拿到 256 KiB 却无法校验，只能超时转投，白白浪费。证明无效（重建结果 ≠ `info.root`）时按"提供错误数据"计一次失败。
 
 上传方对 pending request 按本地调度策略排序服务；请求方在途请求数超出协商窗口视为协议违规，**可以**断开连接。下载进入尾声（剩余 block 的全部 piece 均已在途）时进入 endgame 模式：向所有持有者重复请求同一 piece，先到先用，其余以 `cancel` 撤销，避免个别慢 Peer 拖住整体完成时间。
 
-两条 DataChannel 复用同一个 SCTP association（同一 DTLS/UDP 五元组），共享同一个拥塞窗口：控制通道的可靠重传会与数据通道竞争带宽。因此"不产生队头阻塞"是**应用层**语义——避免的是应用层排队等待，传输层仍然存在共享拥塞窗口带来的相互影响。控制消息的总体积**应当**受限：`have` 的广播频率、在途请求窗口都不宜取大值；证明**应当**优先走捎带或批量预取（单 block 证明 416 字节，而 64 个连续 block 的批量证明约 896 字节），否则可靠通道会吃掉数据通道的带宽。真正隔离需要为控制与数据各开一个 PeerConnection（各自 ICE / DTLS / cwnd），代价是两次握手且在 TURN 场景下双倍 relay 资源——本设计不采用，靠上述约束缓解。
+两条 DataChannel 复用同一个 SCTP association（同一 DTLS/UDP 五元组），共享同一个拥塞窗口：控制通道的可靠重传会与数据通道竞争带宽。因此"不产生队头阻塞"是**应用层**语义——避免的是应用层排队等待，传输层仍然存在共享拥塞窗口带来的相互影响。控制消息的总体积**应当**受限：`have` 的广播频率、在途请求窗口都不宜取大值；证明**应当**批量而非逐 block（单 block 证明含叶子哈希约 448 字节，而 64 个连续 block 的批量证明约 2.3 KB，摊薄后每 block 约 36 字节），否则可靠通道会吃掉数据通道的带宽。真正隔离需要为控制与数据各开一个 PeerConnection（各自 ICE / DTLS / cwnd），代价是两次握手且在 TURN 场景下双倍 relay 资源——本设计不采用，靠上述约束缓解。
 
 ### 4.6 block 选择与上传调度
 
@@ -389,7 +398,7 @@ DataChannel 是消息语义（SCTP message），每条协议消息即一个消�
 
 非流式下载等价于顺序窗口为空——同一套机制，不引入模式开关。流式场景的观看完成率低，长尾 block 更容易随 Peer 离场而稀缺，窗口外的 rarest first 因此更重要而非更不重要。窗口大小是唯一权衡：过小则网络抖动直接转化为卡顿，过大则趋近纯顺序下载、削弱 swarm 健康度。
 
-下载侧进入一个新的顺序窗口前**应当**用 `request_proof(first_block_index, count)` 一次性预取整段 block 的批量证明（4.2.1 节），而不是逐 block 等待捎带——窗口是连续区间，批量证明的大小与区间长度无关，这是控制面流量最划算的用法；窗口外的 rarest first 是零散 block，走默认捎带即可。
+下载侧进入一个新的顺序窗口前**应当**用 `request_proof(first_block_index, count)` 一次性预取整段 block 的证明（4.2.1 节）——窗口是连续区间，批量证明的上层节点数与区间长度无关，这是控制面流量最划算的用法，也让证明**先于**数据就位。窗口外的 rarest first 是零散 block，由上传方在响应 `request` 时先推 `proof` 再发 chunk（或每次 `request_proof` 取一段）；拿到后**应当**缓存叶子哈希，供同区间的后续 block 查表复用。
 
 上传侧不设显式的 choke / interested 状态机：`request` 本身即兴趣声明，`reject` 与 `pause` / `resume` 即反馈，互惠调度退化为纯本地策略——pending request 优先服务近期向自己上传过数据的 Peer，并保留轮换探索名额（等价 BitTorrent 的乐观 unchoke：被拒的下载方退避后偶尔重试新 Peer）。上传方在带宽耗尽、切换网络或准备退出时**应当**主动发 `pause` 而不是逐条 `reject`。调度策略实现可替换（例如换成中心化调度），不影响协议互操作。
 
@@ -415,10 +424,12 @@ TURN 只转发密文流量（DTLS），不能成为内容可信边界。凭据�
                  "https://tracker2.example.com"]   Tracker 地址列表，不参与哈希；可空（依赖客户端配置）
   cdn_list: ["https://cdn.example.com/files/x.iso",
              "https://cdn2.example.com/x.iso"]   可选，CDN 兜底源，不参与哈希；可空
+  leaf_hashes: <bytes>                          可选，**内联**的完整叶子哈希列表（n × 32 字节），不参与哈希；
+                                                等价于 BT v2 的 piece layers（同样置于 info 之外）
   proof_list: ["https://cdn.example.com/files/x.iso.hashes",
                "https://cdn2.example.com/x.iso.hashes"]
-                                                 可选，Merkle 叶子哈希列表的 HTTP(S) 源，不参与哈希；
-                                                 使用 cdn_list 时**必须**提供（见下文）
+                                                 可选，同一份列表的 HTTP(S) 源，不参与哈希；
+                                                 与 leaf_hashes 二选一或并存，见下文
   info: {                                        内容身份，被哈希
     v: 2                                         info 格式版本，当前必须为 2
     name: "..."                                  可选，建议文件名，仅展示用，不参与身份
@@ -436,9 +447,17 @@ info_hash = SHA-256(canonical info 字节串)
 
 `cdn_list` 指向承载同一字节内容的 HTTP(S) 地址，客户端将其当作**拥有全部 block 的虚拟 Peer**：block 请求映射为 HTTP Range 请求，响应数据照常经 Merkle 证明校验，因此无需信任 CDN 本身（对应 BT 的 web seeding，BEP 19）。CDN 的用量与优先级——P2P 优先、CDN 兜底；流式场景顺序窗口可 CDN 优先保播放体验——是纯本地策略，不占数据面消息集。CDN 同时回答了冷启动：全新文件的第一个完整副本由发布者置于 CDN 即可，无需任何初始 seeder；swarm 衰竭（Peer 走光、TTL 过期）时 CDN 同样兜底。
 
-**但"数据 + 证明"必须成对可得**：Merkle 化之后，校验一个 block 需要一条由**持有树的人**提供的证明。冷启动场景下全网零 seeder，唯一的数据源是 CDN，而 CDN 只提供字节——若不额外提供证明来源，客户端从 CDN 拿到的 block 无法进入 verified 状态，CDN 兜底路径就是坏的。因此 `proof_list` 是 CDN 兜底的配套物：它指向完整的叶子哈希列表（`ceil(length/block_size) × 32` 字节，定长，可 Range 拉取），客户端下载后**本地重建 Merkle 树根**并与 `info.root` 比对——比对通过才采信这份列表，之后从 CDN 取任意 block 都能由本地列表现算证明并校验。**这是自校验的：列表的正确性由 `info.root` 保证，而 root 由 `info_hash` 保证，全程不引入对 CDN 的信任。**
+**叶子哈希列表的三条来源**。Merkle 化之后，校验一个 block 需要"数据承诺"——即该 block 的叶子哈希，加上把它挂到 root 上的路径。列表有且只有三种取得方式：
 
-配套约束：使用 `cdn_list` 的客户端**必须**先取得有效的 `proof_list` 源；`proof_list` 缺失或重建结果与 `info.root` 不符时，客户端**不得**把 CDN 数据标记为 verified（**可以**按本地策略降级为未校验使用并明确提示，或停止使用该 CDN 源）。`proof_list` 与 `cdn_list` 不必一一对应，但**应当**指向同一份内容；列表只需拉取一次即可缓存复用（n = 8192 时为 256 KB）。
+1. **种子内联 `leaf_hashes`**（小文件推荐）：完整列表直接放在 envelope 层、不参与 `info_hash`，等价于 BT v2 的 `piece layers`（BT 同样把它放在 info 之外，正是为了不让 info 变大）。256 KiB block 下 1 GiB 文件为 128 KiB、8 GiB 为 1 MiB——这个量级内联进种子文件完全可接受。
+2. **`proof_list` 拉取**（大文件）：同一份列表的 HTTP(S) 源，`n × 32` 字节定长，可用 Range 分段拉取。
+3. **wire 上用 `request_proof` 向 Peer 要**（4.5 节）：不依赖任何种子外数据，但**冷启动时没有 Peer 可问**。
+
+因此使用 `cdn_list` 的客户端**必须**先从前两条之一取得列表：冷启动场景（全新文件、全网零 seeder）下唯一的数据源是 CDN，而 CDN 只提供字节——没有列表，从 CDN 拿到的 block 无法进入 verified 状态，兜底路径就是坏的。
+
+**采信方式是自校验的**：客户端下载（或读到）列表后**本地重建 Merkle 树根**并与 `info.root` 比对，通过才采信——列表的正确性由 `info.root` 保证，root 由 `info_hash` 保证，**全程不引入对 CDN 的信任**；CDN 即使同时提供数据与"证明"也骗不过这一关。列表只需取得一次即可缓存复用（n = 8192 时为 256 KB）。
+
+配套约束：`leaf_hashes` 与 `proof_list` 都缺失、或重建结果与 `info.root` 不符时，客户端**不得**把 CDN 数据标记为 verified（**可以**按本地策略降级为未校验使用并明确提示，或停止使用该 CDN 源）。`proof_list` 与 `cdn_list` 不必一一对应，但**应当**指向同一份内容。若 `leaf_hashes` 与 `proof_list` 同时存在，客户端**应当**优先采信能通过校验的那一份。
 
 Tracker 不存储种子文件与 info——与 BT 的 tracker 不存 .torrent 一致。分享有两种形态：完整种子文件自包含、双击即用（`tracker_list` 即 Tracker）；只分享 `info_hash`（magnet 模式）时，Tracker 来自客户端默认配置。两个来源合并去重、依次尝试（列表顺序即偏好），天然 failover；`tracker_list` 长度上限由实现配置。
 
@@ -447,11 +466,12 @@ Tracker 不存储种子文件与 info——与 BT 的 tracker 不存 .torrent �
 - `v` 位于 info 内部：版本决定哈希覆盖字段的解释方式，**必须**参与哈希——否则旧客户端可能在新格式上通过哈希校验并静默误读（BT v1 的 info dict 无版本字段，v1/v2 割裂即其后果）。envelope 层不设版本号，其字段误读是良性的（连错 Tracker → query 失败 → failover），未知字段忽略已覆盖演进。
 - `v` **必须**为 2；`v: 1`（内嵌全量 `hashes` 列表）**必须**拒绝解析，不做兼容（理由见 5.1 节）。
 - `root` **必须**为 32 字节。叶子数 `n = ceil(length / block_size)`；树的构造、证明格式与校验算法见 4.2.1 节。最后一个 block 可短于 `block_size`，其叶子哈希按实际长度计算。
+- 若存在 `leaf_hashes`，其长度**必须**等于 `n × 32` 字节，且由它重建的树根**必须**等于 `root`；二者任一不符则整个种子文件**必须**拒绝（BT v2 对 `piece layers` 有同样的"torrent 无效"规定）。它位于 envelope 层、不参与 `info_hash`，因此可以独立更新而不改变内容身份。
 - `block_size` **必须**为 2 的幂且在 256 KiB–4 MiB 内；`piece_size` **必须**整除 `block_size`。`block_size` 是纯性能参数——info 体积已与文件大小解耦，不再存在"block 数上限"之类的约束。
 - 解析前**必须**检查种子文件总长上限与 `length` 上限（实现可配置），防御恶意巨型文件的 DoS：info 虽已常数级，但 `length` 仍决定位图大小（`n/8` 字节）与本地状态规模。
 - 未知字段忽略以保持向前兼容，但 `info_hash` 始终是对 canonical info 字节串的 SHA-256，生成方只**应当**写入规范定义的字段。
 
-内容校验改为 Merkle 证明而非全量哈希列表，收益有三：info 从 `O(n)` 降为 `O(1)`（单条消息即可传输，magnet 模式不再受文件大小限制，也不需要 info 分块传输协议）；`block_size` 摆脱大小上限约束回归纯性能参数；代价是每个 block 多传一条证明（单个 block 416 字节，批量摊薄后每 block 十余字节，见 4.2.1 节），且 CDN 兜底路径需要配套的 `proof_list`（5.1 节）。
+内容校验改为 Merkle 证明而非全量哈希列表，收益有三：info 从 `O(n)` 降为 `O(1)`（单条消息即可传输，magnet 模式不再受文件大小限制，也不需要 info 分块传输协议）；`block_size` 摆脱大小上限约束回归纯性能参数；代价是每个 block 多传一份证明（单个 block 含叶子哈希约 448 字节，批量摊薄后每 block 约 36 字节，见 4.2.1 节），且 CDN 兜底路径需要配套的叶子哈希列表来源（`leaf_hashes` 或 `proof_list`，5.1 节）。
 
 ### 5.3 磁力链格式
 
@@ -1072,14 +1092,14 @@ Peer 之间的消息是对称、单向的，没有控制面那种请求-响应�
 | `SendInfo` / `OnInfo` | 对端 → 请求方 | info 字节串；接收方校验 `SHA-256 == info_hash` 后使用 |
 | `SendHave` / `OnHave` | A ↔ B | 每验证一个 block 广播给所有已连接 Peer |
 | `SendRequest` / `OnRequest` | 下载方 → 上传方 | 在途窗口内；响应为 `chunk` 流或 `reject` |
-| `SendChunk` / `OnChunk` | 上传方 → 下载方 | 数据本体，1024 字节/条，走数据通道；block 的最后一个 chunk 捎带该 block 的 Merkle 证明 |
+| `SendChunk` / `OnChunk` | 上传方 → 下载方 | 数据本体，1024 字节/条，走数据通道；末尾 chunk 可捎带证明作冗余，但不得作为唯一来源 |
 | `SendChunkNack` / `OnChunkNack` | 下载方 → 上传方 | 批量请求重传缺失 chunk |
 | `SendPieceDone` / `OnPieceDone` | 下载方 → 上传方 | 收齐确认，上传方释放缓冲 |
 | `SendReject` / `OnReject` | 上传方 → 下载方 | 按单个请求粒度拒绝，含 `retry_after`；下载方必须遵守退避或转投 |
 | `SendPause` / `OnPause` | 上传方 → 下载方 | 连接粒度停止服务，含 `retry_after`；下载方必须停发新 request |
 | `SendResume` / `OnResume` | 上传方 → 下载方 | 恢复服务；连接建立时默认 resume |
-| `SendRequestProof` / `OnRequestProof` | 下载方 → 上传方 | 预取连续 block 区间的批量证明（顺序窗口推荐） |
-| `SendProof` / `OnProof` | 上传方 → 下载方 | `(level, index, hash)` 节点列表；校验见 4.2.1 节 |
+| `SendRequestProof` / `OnRequestProof` | 下载方 → 上传方 | 取连续 block 区间的证明；走控制通道，不受 `pause` 限制 |
+| `SendProof` / `OnProof` | 上传方 → 下载方 | 叶子哈希段 + 上层节点，先于（或平行于）数据发出；校验见 4.2.1 节 |
 | `SendCancel` / `OnCancel` | 下载方 → 上传方 | 撤销在途请求（endgame / 转投） |
 
 ## 8. 安全性考量
@@ -1102,7 +1122,8 @@ Peer 之间的消息是对称、单向的，没有控制面那种请求-响应�
 - 恶意 Peer 投递损坏数据：Merkle 证明校验使污染数据无法进入 verified 状态，攻击者最多浪费下载方带宽，并累积失败计数直至被断开与拒绝重连。
 - 恶意 Peer 提供无效证明：证明的正确性判据是"重建结果 == `info.root`"，root 由 `info_hash` 自校验——攻击者无法伪造一条能通过校验的假证明，只能让下载方白跑一遍，同样计入失败。
 - 伪造 info 或谎报 bitfield：`SHA-256(info) == info_hash` 自校验使伪造 info 无法通过；谎报 bitfield 的 Peer 要么交不出数据计入失败，要么伪造数据过不了证明校验。
-- CDN 内容不可信：CDN 作为虚拟 Peer 的数据同样经证明校验，CDN 被入侵或内容被篡改不产生额外信任面。前提是证明来源可用——`proof_list` 提供的叶子哈希列表由客户端本地重建 root 后采信（5.1 节），因此 CDN 即使同时提供数据与"证明"也无法骗过校验；`proof_list` 不可用时 CDN 数据**不得**进入 verified 状态。
+- CDN 内容不可信：CDN 作为虚拟 Peer 的数据同样经证明校验，CDN 被入侵或内容被篡改不产生额外信任面。前提是"数据承诺"来源可用——`leaf_hashes` / `proof_list` 提供的叶子哈希列表由客户端本地重建 root 后采信（5.1 节），因此 CDN 即使同时提供数据与"证明"也无法骗过校验；两者都不可用时 CDN 数据**不得**进入 verified 状态。
+- 上传方给数据却不给证明：数据 unreliable、证明 reliable，若证明可被拒绝，下载方拿到整块却无法校验，只能超时转投——一种低成本的带宽浪费攻击。规范以"服务了数据后**不得**拒绝提供其证明"与"`request_proof` 不受 `pause` 限制"两条约束堵住（4.5 节），对应 BEP 52 对 `hash request` 的同一规定。
 - 恶意巨型种子文件：解析前检查总长与 `length` 上限（第 5.2 节），防御 DoS。
 
 ## 9. 参考资料
