@@ -2,7 +2,7 @@
 
 | 状态 | 最后更新 |
 | --- | --- |
-| 设计稿（Experimental） | 2026-08-21 |
+| 设计稿（Experimental） | 2026-09-20 |
 
 ## 1. 引言
 
@@ -23,7 +23,7 @@
 - **STUN Server**：供 ICE 收集公网映射候选地址。
 - **TURN / Relay Server**：无法直连时经 ICE relay candidate 转发数据流。
 
-**`peer_id`**：由客户端长期保存的 Ed25519 公钥派生的可读字符串，格式为 base32(SHA-256(public_key)) + bech32 校验位，约 53 字符，例如 `ABCDEF234567...`。客户端本地生成密钥对、不由 Tracker 分配——密钥即身份，Tracker 只是发现与授权的控制面（密钥轮换即更换身份，见第 3.1 节）。base32 字母表为 RFC 4648（不含 `0/O/1/I` 以避免视觉混淆），bech32 校验位（BCH 码）可检测 4 位以内的转录错误。`peer_id` 同时用于协议消息、UI 显示、数据库主键——不再区分"二进制 ID"与"可读编码"。
+**`peer_id`**：由客户端长期保存的 Ed25519 公钥派生的可读字符串，格式为 base32(SHA-256(public_key)) + bech32 校验位，共 58 字符（32 字节 → base32 52 字符 + 6 字符校验位），例如 `ABCDEF234567...`。客户端本地生成密钥对、不由 Tracker 分配——密钥即身份，Tracker 只是发现与授权的控制面（密钥轮换即更换身份，见第 3.1 节）。base32 字母表为 RFC 4648（不含 `0/O/1/I` 以避免视觉混淆），bech32 校验位（BCH 码）可检测 4 位以内的转录错误。`peer_id` 同时用于协议消息、UI 显示、数据库主键——不再区分"二进制 ID"与"可读编码"。
 
 **Ed25519**：本设计全程使用 Ed25519 作为签名算法。选择理由：公钥仅 32 字节、签名 64 字节、验签速度比 RSA-2048 快 10–50 倍（对每次 `join` 都要签名的移动端场景关键）、抗侧信道攻击。本设计**不**使用 RSA、ECDSA 或 GPG/OpenPGP 密钥格式——客户端自己生成并保存 Ed25519 密钥对，不依赖外部密钥管理工具。
 
@@ -36,7 +36,7 @@
 | | 控制面 | 数据面 |
 | --- | --- | --- |
 | 参与方 | 客户端 ↔ Tracker / Punch / STUN / TURN | 客户端 ↔ 客户端（直连） |
-| 职责 | 身份与授权（JWT）、在线 Binding、资源索引（announce / query）、连接信令（SDP 与 ICE candidate 中继）、TURN 授权 | 连接建立与身份锚定（ICE / DTLS）、数据组织（block / piece）、块可见性（bitfield / have）、传输（request / reject / piece / cancel）、取块与上传调度 |
+| 职责 | 身份与授权（JWT）、在线 Binding、资源索引（announce / query）、连接信令（SDP 与 ICE candidate 中继）、TURN 授权 | 连接建立与身份锚定（ICE / DTLS）、数据组织（block / piece）、块可见性（bitfield / have）、传输（request / reject / chunk / piece_done / cancel）、取块与上传调度 |
 | 消息形态 | 请求-响应对（Punch 侧另有常驻 / 瞬时信道） | 对称单向消息 |
 | 信任基础 | 短命 JWT、持钥证明与 MAC | 端到端 DTLS 与 block 哈希校验 |
 
@@ -82,7 +82,7 @@ sequenceDiagram
 
     A->>T: query(info_hash)
     T-->>A: B peer_id、公钥、Punch B 地址与公钥、connect JWT（target_peer_id=B、connection_id）
-    Note over T,A: 不返回 B 的公网地址或候选地址；connection_id 由 Tracker 生成并签入 JWT，签发时记录 connection_id → (A, B, info_hash)
+    Note over T,A: 不返回 B 的公网地址或候选地址；connection_id 由 Tracker 生成并签入 JWT（含 grace_until），Tracker 不保存 connection 记录
 
     A->>PB: signal(type=offer, connection_id, SDP offer + A candidates, connect JWT)
     PB->>PB: 原子登记 connection_id（一次性）；验签与 claims 校验
@@ -109,14 +109,15 @@ sequenceDiagram
         B->>A: bitfield
         loop 下载循环（顺序窗口 / rarest first 选 block，pipelining 维持在途请求）
             A->>B: request(block_index, piece_offset, length)
-            B-->>A: piece（走数据通道）或 reject（退避 / 转投）
+            B-->>A: chunk × N（1024 B/条，走数据通道）或 reject（含 retry_after）
+            A->>B: chunk_nack（缺失 chunk）或 piece_done（收齐）
         end
         Note over A,B: block 集齐 → SHA-256 校验 → verified → 广播 have；哈希不匹配 → 回 partial 重下并计失败
     else 直连失败
-        Note over T: 依据签发 connect JWT 时的 connection 记录校验请求方身份
-        A->>T: relay_credentials(connection_id)
+        Note over T: 验 connect JWT 本体（签名 + sub/target + info_hash + grace_until）
+        A->>T: relay_credentials(connect_jwt)
         T-->>A: A 的 TURN REST 凭据
-        B->>T: relay_credentials(connection_id)
+        B->>T: relay_credentials(connect_jwt)
         T-->>B: B 的 TURN REST 凭据
         A<<->>TURN: 加密数据流
         TURN<<->>B: 加密数据流
@@ -131,7 +132,7 @@ sequenceDiagram
 
 #### 3.1.1 密钥生成与注册
 
-客户端首次启动时本地生成 Ed25519 密钥对（私钥永不外传，**应当**以操作系统提供的密钥存储机制保管，如 macOS Keychain / Android Keystore / iOS Secure Enclave）。`peer_id` 由公钥派生：`peer_id = base32(SHA-256(public_key)) + bech32_checksum`（见 1.3 节，约 53 字符的字符串）。
+客户端首次启动时本地生成 Ed25519 密钥对（私钥永不外传，**应当**以操作系统提供的密钥存储机制保管，如 macOS Keychain / Android Keystore / iOS Secure Enclave）。`peer_id` 由公钥派生：`peer_id = base32(SHA-256(public_key)) + bech32_checksum`（见 1.3 节，58 字符的字符串）。
 
 客户端向 Tracker 发起一次性的 `register` 请求，建立 `peer_id → public_key` 的全网唯一映射：
 
@@ -145,8 +146,13 @@ Tracker 验证三项后**必须**入库：
 1. `peer_id` 解码后的 32 字节 == `SHA-256(public_key)` —— 防止伪造 `peer_id` 指向他人的公钥。
 2. `verify(public_key, signature)` —— 确认请求方确实持有对应私钥。
 3. `peer_id` 未被注册，或原注册记录已过期（见下文 TTL）。
+4. `peer_id` 未被吊销——吊销是**永久**状态，见 3.1.4 节。
 
-注册记录带 TTL（**应当**为 90 天，可配置），到期后 `peer_id` 可被重新注册。peer **必须**在 TTL 内 `login` 续期；续期时 Tracker **应当**刷新 TTL，连续活跃的 peer 无需重复 `register`。
+注册记录带 TTL（**应当**为 90 天，可配置）。peer **必须**在 TTL 内 `login` 续期；续期时 Tracker **应当**刷新 TTL，连续活跃的 peer 无需重复 `register`。
+
+由于 `peer_id` 由公钥派生，注册记录过期后能以该 `peer_id` 重新注册的**只有原私钥持有者**——不存在被他人抢注的可能。若该 `peer_id` 已被吊销，则**永久不得再次注册**。
+
+`register` 是零门槛的身份建立入口，**应当**施加速率限制或准入控制（按 IP / 网段限流、邀请码、工作量证明或外部绑定，任选其一）——否则任何人可批量生成 Ed25519 密钥对撑爆身份注册表。
 
 #### 3.1.2 登录
 
@@ -183,11 +189,24 @@ revocation_token = sign(client_private_key, "revoke" || peer_id || timestamp)
 revoke(peer_id, revocation_token)
 ```
 
-Tracker 用 peer_id 对应的 public_key 验签 token（验证"这确实是私钥持有者授权的吊销"），验签通过后将 `peer_id` 加入 `revoked` 列表（带吊销时间戳）。此后任何针对该 `peer_id` 的 `login` / `join` 请求**必须**拒绝；Punch Server 在 `join` 时**应当**通过 Tracker 的公开 API 校验 `peer_id` 是否被吊销（可短时间缓存以降低延迟）。
+Tracker 用 peer_id 对应的 public_key 验签 token（验证"这确实是私钥持有者授权的吊销"），验签通过后**必须**原子地执行以下四项：
 
-**为什么 token 由客户端生成而非 Tracker**：Tracker 不持有客户端私钥，签不出 token。只有客户端能用私钥签，Tracker 只能验签。这保证了吊销权归用户所有——即使 Tracker 被攻破，攻击者拿到数据库也无法伪造吊销（没私钥签不出 token），只能阻止合法用户提交吊销（DoS，但无法冒充身份）。
+1. 将 `SHA-256(public_key)` 写入 **`revoked_keys`** —— **永久记录，不设 TTL**；
+2. 删除该 `peer_id` 的注册记录，使其无法再 `login`；
+3. 记录 `revoked_at` 时间戳，作为所有已签发票据的失效判据；
+4. 通知各 Punch Server 清除该 `peer_id` 的 Binding（Punch 侧也可等 Binding 自然过期，但**应当**主动清理）。
 
-`revoked` 列表带 TTL（**应当**为 7 天，与 register TTL 解耦）。TTL 到期后 `peer_id` 可被重新注册——这平衡了"吊销有效性"与"peer_id 永久占用"。Token 丢失时只能等 register TTL 过期后重新注册（期间身份仍可被冒充，因此客户端**应当**妥善备份 token）。
+**吊销是终止状态，不因任何 TTL 而解除。** 由于 `peer_id = base32(SHA-256(public_key)) + 校验位`，吊销 `peer_id` 等价于吊销这把公钥——不存在"换一把私钥继续用同一个 `peer_id`"的可能。因此给吊销记录设置 TTL 等同于给攻击者留一条等待绕过的路径：TTL 到期后，持有泄露私钥者直接 `login` 即可恢复身份，连重新注册都不必。以 `SHA-256(public_key)` 而非 `peer_id` 字符串作主键，是为了杜绝"同一把密钥换个编码再来一次"。
+
+此后**所有**票据的校验统一为"签发时刻晚于吊销时刻"：
+
+```
+if revoked_at exists and token.iat <= revoked_at: 拒绝
+```
+
+`iat` 是 JWT 标准 claim，无需新增字段。这一条判据同时覆盖 `login`、`punch.join` 与 `connect`，因此吊销**立即生效**——不必维护"已吊销但仍在途"的 session 黑名单，也不必等 session 自然过期。Punch Server 在 `join` 时**应当**通过 Tracker 的公开 API 校验 `peer_id` 是否被吊销（可短时间缓存以降低延迟；缓存时长即吊销生效的延迟上界，**应当**控制在分钟级）。
+
+**为什么 token 由客户端生成而非 Tracker**：吊销权归用户所有——即使 Tracker 被攻破，攻击者拿到数据库也无法伪造吊销（没有私钥签不出 token），只能阻止合法用户提交吊销（DoS，但无法冒充身份）。代价是客户端**必须**在 `register` 时就离线保存好 token，而现实是不会有用户主动备份一个字符串：**token 丢失即永久丧失吊销能力**。因此实现**可以**额外提供一条由 Tracker 签发的长期 revoke credential 作为备份路径——它证明的是"吊销授权"而非"私钥持有"，与客户端自签的 token 并行、任一可用。两者并存时的取舍是：Tracker 签发提高了可用性，但也让 Tracker 具备单方吊销的能力。
 
 #### 3.1.5 客户端 UI 中的 peer_id
 
@@ -216,7 +235,17 @@ Tracker 不保存或下发这些地址：候选地址会随网络切换而变化
 
 B 使用 `announce` 登记自己可提供的资源：可一次 `add` 一组 `info_hash`（各带 `complete` 标志、TTL），或一次 `del` 一组 `info_hash` 主动撤下索引（不必等 TTL 过期）；记录**必须**带 TTL（服务端设置最大值），离线后自动失效。A 使用 `query(info_hash)` 查询少量候选 Peer。`info_hash` 固定为 info 的 SHA-256 摘要，info 的编码与字段见第 5 节。`complete` 标记是否持有整个文件，供 query 做粗粒度候选筛选（避开与自己没有交集的 Peer，降低 connect JWT 的无效消耗）；块级信息不上报 Tracker——Tracker 只维护 peer_id → info_hash 映射与 `complete` 标志，不保存全局块位图，细粒度的块可见性与稀缺度属于数据面，由直连双方交换维护。**不得**使用调用方自定义的文件名或非规范哈希作为资源标识。
 
-Tracker 的查询结果仅包含 B 的 `peer_id`、B 的身份公钥、B 所在 Punch Server 的地址与其公钥（`punch_public_key`，供 A 验证 Punch B 的服务器身份）和一次连接所需的 `connect` JWT；**不包含** B 的公网地址或候选地址。Punch Server 的地址与公钥均由 Tracker 在 query 时实时读取并随响应下发——客户端**不得**缓存 Punch 清单或地址，时效性由 Tracker 的当前状态保证（见 7.1 节的部署模型）。`connect` JWT 以自身的一次性 `jti` 作为 `connection_id`（由 Tracker 生成、不可预测）；Tracker 在签发时记录 `connection_id → (A, B, info_hash, 创建时间)`，TTL 为连接建立超时，作为后续 `relay_credentials` 的授权依据。**应当**限制候选数量、对 query/announce 按身份和资源施加速率限制，并限制单个资源的返回分页，以避免热门资源的索引放大和完整 Peer 列表泄露。
+Tracker 的查询结果仅包含 B 的 `peer_id`、B 的身份公钥、B 所在 Punch Server 的地址与其公钥（`punch_public_key`，供 A 验证 Punch B 的服务器身份）和一次连接所需的 `connect` JWT；**不包含** B 的公网地址或候选地址。Punch Server 的地址与公钥均由 Tracker 在 query 时实时读取并随响应下发——客户端**不得**缓存 Punch 清单或地址，时效性由 Tracker 的当前状态保证（见 7.1 节的部署模型）。`connect` JWT 以自身的一次性 `jti` 作为 `connection_id`（由 Tracker 生成、不可预测），并额外携带 `grace_until`（中继授权截止时刻，见 3.4.1 节）。**Tracker 不保存 connection 记录**：JWT 自身已绑定 `sub`（A）、`target_peer_id`（B）、`info_hash` 与 `connection_id`，`relay_credentials` 直接验 JWT 本体即可完成授权，无需查库——这同时让 Tracker 真正无状态化（见 7.1 节）。**应当**限制候选数量（默认 `limit=10`，见 7.2.1 节）、对 query/announce 按身份和资源施加速率限制，并限制单个资源的返回分页，以避免热门资源的索引放大和完整 Peer 列表泄露。
+
+#### 3.4.1 连接相关时间常量
+
+| 常量 | 建议值 | 含义 |
+| --- | --- | --- |
+| `ICE_TIMEOUT` | 20 s | 客户端判定直连失败、转入 TURN 回退的等待时间 |
+| `CONNECT_JWT_EXP` | 60 s | connect JWT 有效期（打洞窗口） |
+| `RELAY_GRACE` | 900 s | 自 `iat` 起算的中继授权截止时刻（`grace_until = iat + RELAY_GRACE`） |
+
+三者**必须**满足 `ICE_TIMEOUT < CONNECT_JWT_EXP < RELAY_GRACE`。`RELAY_GRACE` 之所以远大于前两者：relay 回退发生在 ICE 超时**之后**，此时 connect JWT 的 `exp` 通常已过——授权判据是 `now <= grace_until`，而**不是** `now <= exp`。若把授权截止时间设成"连接建立超时"，授权与回退将在同一时刻到期，回退永远拿不到凭据。Punch Server 侧维护 `jti` 一次性消费记录的时长**应当**与 `RELAY_GRACE` 对齐。
 
 ### 3.5 Punch 信令交换
 
@@ -230,7 +259,7 @@ A 使用 `connect` JWT 中的 `connection_id`（即该 JWT 的一次性 `jti`，
 
 A 一侧的信令走**连接范围的瞬时加密信道**：随 A 的首个 `signal`（offer）建立，生命周期与 Punch B 上的连接记录一致（连接建立成功或超时即关闭），answer、trickle candidate、cancel 与错误都经它双向传递。首个 `signal` 以 connect JWT 认证；此后同一信道上的消息不再重复验证 JWT——信道即凭据，relay 回退阶段的 candidate 交换因此不受 JWT `exp` 限制。Punch B 在首个 `signal` 的响应中同时下发随机生成的 `signal_key`（对称密钥，只在加密信道内出现，有效期与连接记录一致）；这与 Binding 的模式同构：punch JWT 之于 `binding_key`，正如 connect JWT 之于 `signal_key`。若瞬时信道意外断开，A 重连 Punch B 并出示 `connection_id` 与 `signal_key` 即可恢复该连接的信令；Punch B 在连接记录中保留已收到但未送达 A 的信令（通常是 answer 与少量 candidate），重连后按序补发，送达或超时后丢弃。
 
-B 一侧的信令送达依赖 B 与 Punch B 之间在 join 时建立的常驻加密信道：heartbeat 同时为该信道保活；信道断开即视为 Binding 失效，Punch Server 对后续连接请求返回可区分的"目标不可达"错误。两类信道的具体传输均不作限定，TCP+TLS、UDP+DTLS 或 QUIC 均可，硬性要求相同——机密性与完整性（`binding_key`、`signal_key` 与 connect JWT 均只经此类信道传输）、服务器认证（防止假 Punch Server 接管信令面；验证锚点为 login / query 响应下发的 Punch Server 公钥，客户端连接 Punch 时校验其证书与公钥匹配）、以及网络切换后的可恢复性（常驻信道凭重新 join 与 `transport_generation` 语义恢复，瞬时信道凭 `signal_key` 重连）。
+B 一侧的信令送达依赖 B 与 Punch B 之间在 join 时建立的常驻加密信道；信道断开即视为 Binding 失效，Punch Server 对后续连接请求返回可区分的"目标不可达"错误。注意 `heartbeat` 与常驻信道是**两条独立的路径**：heartbeat 走 UDP（见 7.2.2 节），职责是维持 NAT 映射与刷新 Binding TTL；常驻信道的存活由传输层自身判定（TCP keepalive、QUIC idle timeout 或 DTLS 超时），不由 heartbeat 承载——否则 Punch 无法区分"信道断了但 NAT 映射还在"与"两者都断了"。两类信道的具体传输均不作限定，TCP+TLS、UDP+DTLS 或 QUIC 均可，硬性要求相同——机密性与完整性（`binding_key`、`signal_key` 与 connect JWT 均只经此类信道传输）、服务器认证（防止假 Punch Server 接管信令面；验证锚点为 login / query 响应下发的 Punch Server 公钥，客户端连接 Punch 时校验其证书与公钥匹配）、以及网络切换后的可恢复性（常驻信道凭重新 join 与 `transport_generation` 语义恢复，瞬时信道凭 `signal_key` 重连）。
 
 这也是部署前提：Punch Server 的容量需按两类连接估算——面向 B 的常驻 Binding 数（小时级），以及面向 A 的挂起瞬时信道数（数十秒级，受 connect JWT 有效期与连接超时共同框定），并对单个 peer/IP 的并发挂起信道数设上限，防止批量挂连接耗尽资源。
 
@@ -254,9 +283,10 @@ B 一侧的信令送达依赖 B 与 Punch B 之间在 join 时建立的常驻加
 数据组织分为两个粒度，分别服务校验成本与传输流水线：
 
 - **block：校验单位。** info 内嵌每个 block 的 SHA-256（格式见第 5 节），逐 block 校验即查表。BitTorrent v1 的 pieces 与 v2 的 piece layers 同为全量哈希列表；注意命名相反——BT 称该哈希单位为 piece，其 wire 消息 `piece` 装载的却是本设计的 piece，本设计的命名与 BT wire 层一致。block 大小**必须**是 piece 大小的整数倍，典型 256 KiB–4 MiB，最后一个 block 可以短于标准大小。客户端只对集齐全部 piece 的 block 计算哈希；校验通过才进入 verified 状态，也只有 verified 的 block 可以响应他人的请求。单个 piece 损坏最多作废一个 block，端到端校验使恶意 Peer 无法污染数据。
-- **piece：传输单位。** 固定 16 KiB（2^14 字节），文件末尾的 piece 可以短。请求、重传与取消都以 piece 为粒度；不对单个 piece 做哈希校验。
+- **piece：请求与调度单位。** 固定 16 KiB（2^14 字节），文件末尾的 piece 可以短。请求、重传与取消都以 piece 为粒度；不对单个 piece 做哈希校验。
+- **chunk：传输单位。** 固定 1024 字节（2^10 字节），文件末尾的 chunk 可以短。piece 在发送前拆成 chunk，每条 chunk 作为一条独立的数据通道消息；丢失时只重传缺失的 chunk（理由见 4.5 节）。chunk 是传输层概念，不出现在请求语义中。
 
-block 的生命周期为 missing → partial → downloaded → verified 四态：partial 状态下为该 block 维护 piece 级位图；集齐全部 piece 进入 downloaded，哈希匹配进入 verified，不匹配则回到 partial 重新请求，并对提供错误数据的 Peer 记一次失败（失败计数达到阈值后断开并在一段时间内拒绝重连）。持久化采用 in-place 写入：piece 直接写最终 offset，不做"验证后再落盘"的二次拷贝；重启后对未 verified 的 block 重新校验，能通过哈希的保留 partial 进度，其余丢弃。info 面向单文件：一个 `info_hash` 对应一个文件、一张位图；多文件分发由多个 `info_hash` 并存表达（各自独立切分与校验），不引入跨文件的 block 组织。
+block 的生命周期为 missing → partial → downloaded → verified 四态：partial 状态下为该 block 维护 piece 级位图，正在传输的 piece 另维护 chunk 级位图；集齐全部 piece 进入 downloaded，哈希匹配进入 verified，不匹配则回到 partial 重新请求，并对提供错误数据的 Peer 记一次失败（失败计数达到阈值后断开并在一段时间内拒绝重连）。持久化采用 in-place 写入：piece 直接写最终 offset，不做"验证后再落盘"的二次拷贝；重启后对未 verified 的 block 重新校验，能通过哈希的保留 partial 进度，其余丢弃。info 面向单文件：一个 `info_hash` 对应一个文件、一张位图；多文件分发由多个 `info_hash` 并存表达（各自独立切分与校验），不引入跨文件的 block 组织。
 
 ### 4.3 info 拉取（magnet 模式）
 
@@ -274,17 +304,29 @@ block 的生命周期为 missing → partial → downloaded → verified 四态�
 
 每个连接开两条 DataChannel：
 
-- **控制通道**：reliable + ordered，承载 `bitfield`、`have`、`request`、`reject`、`cancel`、`request_info`、`info`；
-- **数据通道**：unreliable + unordered（`maxRetransmits = 0`），只承载 `piece`。丢块不做传输层重传，由应用层的在途超时重新 `request` 或转投其他 Peer 兜底——慢 Peer 的丢包不产生任何队头阻塞。
+- **控制通道**：reliable + ordered，承载 `bitfield`、`have`、`request`、`reject`、`chunk_nack`、`piece_done`、`cancel`、`request_info`、`info`；
+- **数据通道**：unreliable + unordered（`maxRetransmits = 0`），只承载 `chunk`。
 
-DataChannel 是消息语义（SCTP message），每条协议消息即一个消息，无需自定义长度前缀帧；16 KiB piece 远低于消息大小上限，无需分片。请求与响应均为 piece 粒度：
+**为什么数据面必须走 chunk 而不是直接发整个 piece**：SCTP 会把大于路径 MTU 的消息切成多个 DATA chunk 分别发送，而 `maxRetransmits = 0` 是**消息级**的部分可靠——任何一个 DATA chunk 丢失，整条消息作废，已发出的其余字节全部浪费。WebRTC 下 PMTU 约 1200 字节，一条 16 KiB 的消息被切成约 15 个 DATA chunk，于是：
 
-- `request(block_index, piece_offset, length)`：`length` ≤ 16 KiB。同一连接维持固定数量的在途请求（pipelining，典型 5–16 个），使吞吐不受 RTT 限制；在途请求由发送方跟踪，超时未响应即重新 `request` 或转向其他 Peer。
-- `reject`：`request` 的两个响应分支之一，上传方即时、按单个请求粒度拒绝（带宽不足、调度优先级低、请求不合法）；下载方收到后退避重试或转投其他 Peer。
-- `cancel(block_index, piece_offset, length)`：撤销尚在途的请求。
-- `piece`：`request` 的数据响应分支，携带 `block_index`、`piece_offset` 与数据，接收方写入后更新对应 block 的 piece 位图。
+```
+消息成功率 = (1 - p)^15        p=1% → 86%   p=5% → 46%   p=10% → 21%
+```
+
+丢包率被放大 15 倍，且越拥塞越废——恰好在需要它的场景失效。因此传输单位**必须**控制在 PMTU 以内，由应用层负责分片与选择性重传，把丢失的代价从 16 KiB 降到 1 KiB。
+
+DataChannel 是消息语义（SCTP message），每条协议消息即一个消息，无需自定义长度前缀帧。请求与取消以 piece 为粒度，传输以 chunk 为粒度：
+
+- `request(block_index, piece_offset, length)`：`length` ≤ 16 KiB。同一连接维持固定数量的在途请求（pipelining，典型 4–8 个 piece），使吞吐不受 RTT 限制；在途请求由发送方跟踪，超时未响应即重新 `request` 或转向其他 Peer。
+- `chunk(block_index, piece_offset, chunk_offset, data)`：`request` 的数据响应分支，走数据通道，`data` ≤ 1024 字节。接收方按 `chunk_offset` 写入并更新该 piece 的 chunk 位图。
+- `chunk_nack(block_index, piece_offset, chunk_offset[], length[])`：接收方在一个 piece 级超时（`PIECE_TIMEOUT`，建议 `2 × RTT + 100 ms`，按实测 RTT 自适应）后批量请求重传缺失的 chunk。连续 3 次仍未收齐即判定对端为慢 Peer，转投其他 Peer。
+- `piece_done(block_index, piece_offset)`：接收方收齐后确认，上传方释放缓冲；未收到确认时上传方**应当**在 piece 级超时后自行释放。
+- `reject(block_index, piece_offset, length[, retry_after])`：`request` 的另一响应分支，上传方即时、按单个请求粒度拒绝（带宽不足、调度优先级低、请求不合法）。**应当**携带 `retry_after`（毫秒）给出建议退避时长；下载方**必须**遵守，默认策略为指数退避（100 ms 起、上限 5 s），连续多次被拒后转投其他 Peer。
+- `cancel(block_index, piece_offset, length)`：撤销尚在途的请求；未发出的 chunk 不再发送。
 
 上传方对 pending request 按本地调度策略排序服务；请求方在途请求数超出协商窗口视为协议违规，**可以**断开连接。下载进入尾声（剩余 block 的全部 piece 均已在途）时进入 endgame 模式：向所有持有者重复请求同一 piece，先到先用，其余以 `cancel` 撤销，避免个别慢 Peer 拖住整体完成时间。
+
+两条 DataChannel 复用同一个 SCTP association（同一 DTLS/UDP 五元组），共享同一个拥塞窗口：控制通道的可靠重传会与数据通道竞争带宽。因此上文"不产生队头阻塞"是**应用层**语义——避免的是应用层排队等待，传输层仍然存在共享拥塞窗口带来的相互影响。控制消息的总体积**应当**受限（`have` 的广播频率、在途请求窗口都不宜取大值），否则可靠通道会吃掉数据通道的带宽。
 
 ### 4.6 block 选择与上传调度
 
@@ -301,7 +343,9 @@ DataChannel 是消息语义（SCTP message），每条协议消息即一个消�
 
 ### 4.7 TURN 回退
 
-对称 NAT、企业防火墙或 CGNAT 等环境可能导致直连失败。ICE 在连通性检查未通过时自动引入 relay candidate：双方各自调用 `relay_credentials(connection_id)`，Tracker 依据签发 connect JWT 时记录的 `connection_id → (A, B, info_hash)` 校验请求方是该连接的一端、记录仍在 TTL 内（记录 TTL 为连接建立超时，独立于 connect JWT 的 `exp`，因为走到 relay 回退时 JWT 通常已过期），随后换发短期 TURN REST 凭据（coturn 的 static-auth-secret HMAC 方案，username 编码过期时间与配额）；若 TURN 实现支持 JWT 鉴权，也可以直接签发 `relay` JWT。relay 候选地址经 `punch.signal` 的 `type=candidate` trickle 交换，连接记录在超时前**不得**清理。
+对称 NAT、企业防火墙或 CGNAT 等环境可能导致直连失败。ICE 在连通性检查未通过时自动引入 relay candidate：双方各自调用 `relay_credentials(connect_jwt)`，Tracker 直接校验 **connect JWT 本体**——签名有效、`sub` 或 `target_peer_id` 之一为请求方身份、`info_hash` 未封禁、`now <= grace_until`（**不检查** `exp`，理由见 3.4.1 节），随后换发短期 TURN REST 凭据（coturn 的 static-auth-secret HMAC 方案，username 编码过期时间与配额）；若 TURN 实现支持 JWT 鉴权，也可以直接签发 `relay` JWT。relay 候选地址经 `punch.signal` 的 `type=candidate` trickle 交换，Punch Server 侧的连接记录在超时前**不得**清理。
+
+TURN 的选型必须显式评估其**按 allocation 约束对端地址**的能力：coturn 只提供全局静态的 `--allowed-peer-ip` / `--denied-peer-ip`（配置文件里的 IP 段），**没有**按连接动态下发对端白名单的机制。若要求 per-connection 约束，前置网关必须能解析 TURN 的 CreatePermission / ChannelBind 目标地址并做动态决策——这实质是自研一层 TURN 访问控制，工作量须计入实施计划。不做该约束时 TURN 即开放中继，存在滥用与合规风险。
 
 TURN 只转发密文流量（DTLS），不能成为内容可信边界。凭据只发给请求方自身；TURN 或其前置授权网关**必须**只允许该连接的配对端点，若所选标准 TURN 实现无法约束 peer 地址，则**必须**由前置网关实施该策略。
 
@@ -362,12 +406,12 @@ scheme 复用通用的 `magnet:`（BT 未发明专属 scheme，复用的正是 m
 | --- | --- | --- | --- | --- |
 | Tracker API 会话 | `tracker` | `query`、`announce` | `sub` | 分钟级至小时级 |
 | 建立/刷新 Punch Binding | 指定 `punch_id` | `punch` | `sub`、一次性 `jti` | 10–30 分钟 |
-| 请求连接目标 Peer | 指定 `punch_b_id` | `connect` | `sub`、`target_peer_id`、`info_hash`、`connection_id`（即一次性 `jti`） | 数十秒 |
+| 请求连接目标 Peer | 指定 `punch_b_id` | `connect` | `sub`、`target_peer_id`、`info_hash`、`connection_id`（即一次性 `jti`）、`grace_until`（中继授权截止时刻，见 3.4.1 节） | 数十秒（`CONNECT_JWT_EXP`） |
 | TURN 中继授权 | 指定 `turn_region_id` | `relay` | `connection_id`、对端 `peer_id`、带宽/连接数/时长配额（以 `relay` JWT 或 TURN REST username/HMAC 承载） | 分钟级 |
 
 `punch_id` 是 Punch Server 的稳定标识（由 Tracker 维护，见 7.1 节），作为 `aud` 限定票据只能在指定的 Punch Server 消费——一张泄露的 connect / punch JWT 不能拿去其他 Punch 节点使用。`punch_id` 只承担授权受众语义、不参与路由；Punch Server 的地址与公钥由 login / query 响应实时下发，客户端不得自行缓存或推断。
 
-每个服务**应当**至少校验：签名算法和签名、`iss`、`kid`、`aud`、`scope`、`sub`、`nbf`/`exp`；对于 `connect` JWT，还应校验 `target_peer_id`、`info_hash`，以及 `connection_id`（即 `jti`）的一次性消费语义；对于 `punch` JWT，应校验 `jti` 的一次性消费语义（每次 `punch.join` 消费一个 `jti`，重连需重新 login 获取新 punch JWT）。
+每个服务**应当**至少校验：签名算法和签名、`iss`、`kid`、`aud`、`scope`、`sub`、`nbf`/`exp`；对于 `connect` JWT，还应校验 `target_peer_id`、`info_hash`，以及 `connection_id`（即 `jti`）的一次性消费语义；中继授权阶段（4.7 节）额外校验 `grace_until` 而**不是** `exp`；此外所有票据**必须**校验 `iat > revoked_at`（3.1.4 节），使吊销立即生效；对于 `punch` JWT，应校验 `jti` 的一次性消费语义（每次 `punch.join` 消费一个 `jti`，重连需重新 login 获取新 punch JWT）。
 
 JWT 不内嵌发起方公钥。`punch.join` 与 `tracker.register` 的请求体携带 `public_key`，验签前服务端**必须**先校验 `SHA-256(public_key) == JWT.sub`（或 register 的 `peer_id`）确认公钥与身份一致，再用此 `public_key` 验签 `signature`。
 
@@ -377,7 +421,7 @@ JWT 不内嵌发起方公钥。`punch.join` 与 `tracker.register` 的请求体�
 
 Tracker API 基于 HTTPS REST：每个请求独立无状态，session JWT 通过 `Authorization: Bearer <jwt>` 头携带，请求/响应体使用 JSON 编码（`Content-Type: application/json`）。Tracker 不向客户端推送消息，两者之间不维护常驻信道——除 `register` 与 `revoke` 是一次性身份管理请求（不携带 session JWT）外，其余请求均携带 session JWT 按需调用。
 
-Tracker **可以**部署为无状态多实例：实例间共享唯一签名密钥（支持 `kid` 轮换）与一致状态存储（身份注册表、revoked 列表、资源索引、connection 记录，以及 login nonce 的一次性消费语义）。对客户端与 Punch Server 的契约只暴露 Tracker 的**逻辑服务地址**（如负载均衡前的域名），**不得**暴露具体实例——横向扩展是内部实现细节，不影响任何协议契约。Punch Server 清单由 Tracker 维护，来源为部署配置或 Punch Server 向 Tracker 注册（注册携带 `punch_id`、自身公钥、地址、region 与容量，注册对象为 Tracker 的逻辑服务地址而非具体实例，注册协议为内部运维契约、不在本规范的客户端接口范围内）；Tracker 从清单中为 login 分配 Punch Server，并在 query 时实时回填目标 Peer 所在 Punch Server 的地址与公钥。Punch Server 公钥是客户端验证 Punch 服务器身份的锚点（见 3.5 节），与地址解耦——地址会随部署变化，公钥是长期身份。
+Tracker **可以**部署为无状态多实例：实例间共享唯一签名密钥（支持 `kid` 轮换）与一致状态存储（身份注册表、`revoked_keys`（永久）、资源索引，以及 login nonce 的一次性消费语义）。注意 nonce 与 `jti` 的已消费记录**不得**只存于实例内存——多实例下 challenge 与 login 落在不同的实例会直接失败。connection 授权已完全无状态化，不进入共享存储（见 3.4 节）。对客户端与 Punch Server 的契约只暴露 Tracker 的**逻辑服务地址**（如负载均衡前的域名），**不得**暴露具体实例——横向扩展是内部实现细节，不影响任何协议契约。Punch Server 清单由 Tracker 维护，来源为部署配置或 Punch Server 向 Tracker 注册（注册携带 `punch_id`、自身公钥、地址、region 与容量，注册对象为 Tracker 的逻辑服务地址而非具体实例，注册协议为内部运维契约、不在本规范的客户端接口范围内）；Tracker 从清单中为 login 分配 Punch Server，并在 query 时实时回填目标 Peer 所在 Punch Server 的地址与公钥。Punch Server 公钥是客户端验证 Punch 服务器身份的锚点（见 3.5 节），与地址解耦——地址会随部署变化，公钥是长期身份。
 
 `punch.join` / `punch.exit` / `punch.signal` 的请求响应控制面经加密认证信道传输（TCP+TLS、UDP+DTLS 或 QUIC 均可，客户端与 Punch Server 间的常驻与瞬时信令信道同此要求）；为维持 NAT 映射的 `punch.heartbeat` 可以使用 UDP，但**必须**遵循前述 MAC、时钟窗口和序列号校验。消息使用版本化 schema；未知必填字段、超出大小限制的 candidate 列表和不匹配的 `connection_id` 都**必须**拒绝。每个响应至少带协议版本、请求 ID 和明确的错误码。所有时钟校验（`nbf`/`exp`、heartbeat 的时间戳窗口）使用统一的服务端可配置容差（如 ±60 秒），客户端**应当**与可信时间源对时，容差需计入 Tracker 的 nonce 去重窗口、Punch/Tracker 的 `jti` 去重窗口与序列号乱序窗口的计算。
 
@@ -406,7 +450,7 @@ Tracker **可以**部署为无状态多实例：实例间共享唯一签名密�
 | `registered_at` | int64 | 入库时间戳 |
 | `expires_at` | int64 | register TTL 到期时间（默认 90 天） |
 
-**授权与限制**：验证 `peer_id` 解码后的 32 字节 == `SHA-256(public_key)` 与签名；`peer_id` 未被注册或已过期才允许；同 `peer_id` 重复注册幂等返回原记录。TTL 90 天（可配置）。
+**授权与限制**：验证 `peer_id` 解码后的 32 字节 == `SHA-256(public_key)` 与签名；`peer_id` 未被注册或已过期才允许；`peer_id` 未被吊销（吊销永久，见 3.1.4 节）；同 `peer_id` 重复注册幂等返回原记录。TTL 90 天（可配置）。**应当**按 IP / 网段限流或施加其他准入控制，防止批量注册撑爆注册表。
 
 **交互流程**：
 
@@ -419,7 +463,7 @@ sequenceDiagram
     Note over C: 计算 peer_id = base32(sha256(pub)) + checksum
     Note over C: 签名: sign(priv, "register" || peer_id || pub || ts)
     C->>T: POST /peers {peer_id, public_key, signature, timestamp}
-    Note over T: 查注册表: peer_id 未注册或已过期?
+    Note over T: 查注册表: peer_id 未注册或已过期?<br/>查 revoked_keys: 未被吊销?
     Note over T: 验证 peer_id 解码后 == SHA-256(public_key)
     Note over T: 取 public_key 验签
     Note over T: 入库: peer_id → public_key, TTL 90 天
@@ -442,7 +486,7 @@ register 不需要 nonce，因为这是客户端**第一次**联系 Tracker，Tr
 | --- | --- |
 | `204 No Content` | 吊销成功 |
 
-**授权与限制**：验证 token 签名；将 `peer_id` 加入 `revoked` 列表，TTL 7 天。被吊销 `peer_id` 的所有后续请求拒绝。
+**授权与限制**：验证 token 签名；将 `SHA-256(public_key)` 写入 `revoked_keys`（**永久，无 TTL**），删除注册记录，记录 `revoked_at`，并通知 Punch Server 清除 Binding。此后一切 `iat <= revoked_at` 的票据**必须**拒绝（见 3.1.4 节）。被吊销 `peer_id` **永久不得**再次注册。
 
 **交互流程**：
 
@@ -454,8 +498,10 @@ sequenceDiagram
     Note over C: 私钥已泄露, 取出之前保存的 revocation_token
     C->>T: DELETE /peers/{peer_id} {revocation_token}
     Note over T: 取 public_key 验签 token
-    Note over T: 加入 revoked 列表 (TTL 7 天)
-    Note over T: 标记该 peer_id 所有在途 session JWT 失效
+    Note over T: 写入 revoked_keys (永久, 无 TTL)
+    Note over T: 删除注册记录, 记录 revoked_at
+    Note over T: 通知 Punch 清除 Binding
+    Note over T: 此后 iat <= revoked_at 的票据全部拒绝
     T-->>C: 204 No Content
     Note over C,T: 攻击者即使持有旧私钥, 后续 login/join 被拒绝
 ```
@@ -498,7 +544,7 @@ GET /sessions/challenge?peer_id=<peer_id>
 | `turn_servers` | object[] | TURN 服务器列表，每项含 `url`、`region`、`expires_at` |
 | `session_expires_at` | int64 | session JWT 过期时间 |
 
-**授权与限制**：验证签名；nonce 一次性消费；`peer_id` 未被吊销；同时刷新 register TTL。
+**授权与限制**：验证签名；nonce 一次性消费；`peer_id` 未被吊销且 `iat > revoked_at`；同时刷新 register TTL。
 
 **交互流程**：
 
@@ -510,17 +556,17 @@ sequenceDiagram
     C->>T: GET /sessions/challenge?peer_id=ABCDEF...
     Note over T: 查注册表取 public_key
     Note over T: 生成 32 字节随机 nonce
-    Note over T: 存内存: nonce → (peer_id, 60s 过期)
+    Note over T: 存共享存储: nonce → (peer_id, 60s 过期)
     T-->>C: {nonce, expires_at}
 
     Note over C: 用 private_key 签名
     Note over C: sig = sign(priv, "login" || peer_id || nonce || ts)
 
     C->>T: POST /sessions {peer_id, nonce, signature, timestamp}
-    Note over T: 查 nonce 在内存? 属于该 peer_id? 未过期?
+    Note over T: 查 nonce 在共享存储? 属于该 peer_id? 未过期?
     Note over T: 取 public_key 验签
     Note over T: 删除 nonce (一次性消费)
-    Note over T: 检查 peer_id 未被吊销
+    Note over T: 检查 peer_id 未被吊销 (iat > revoked_at)
     Note over T: 签发 session JWT (scope=query,announce)
     Note over T: 签发 punch JWT (scope=punch, aud=punch_id)
     Note over T: 刷新 register TTL
@@ -577,7 +623,7 @@ sequenceDiagram
 | 请求参数 | 位置 | 说明 |
 | --- | --- | --- |
 | `info_hash` | path | `sha256:<hex>` 格式 |
-| `limit` | query | 候选数量上限（默认 50，服务端可裁剪） |
+| `limit` | query | 候选数量上限（默认 10，服务端可裁剪） |
 | `cursor` | query | 分页游标（首次请求不传） |
 
 | 响应字段 | 类型 | 说明 |
@@ -595,7 +641,7 @@ sequenceDiagram
 | `punch_public_key` | string | 该 Punch Server 的 Ed25519 公钥 base64（32 字节解码后），客户端验证其服务器身份用 |
 | `connect_jwt` | string | 一次连接所需的 connect JWT（`scope=connect`，`sub`、`target_peer_id`、`info_hash`、`connection_id` 绑定） |
 
-**授权与限制**：session `query`；限流、防枚举、不得返回 candidates 的公网地址或候选地址；候选数上限防放大。
+**授权与限制**：session `query`；限流、防枚举、不得返回 candidates 的公网地址或候选地址；候选数上限防放大——返回 N 个候选即 N 次签名，故 `limit` 不宜取大值（默认 10）。
 
 **交互流程**：
 
@@ -604,31 +650,33 @@ sequenceDiagram
     participant A as client (A)
     participant T as Tracker
 
-    A->>T: GET /resources/{info_hash}/peers?limit=50&cursor=...<br/>Authorization: Bearer <jwt>
+    A->>T: GET /resources/{info_hash}/peers?limit=10&cursor=...<br/>Authorization: Bearer <jwt>
     Note over T: 验 session JWT (scope 含 query?)
     Note over T: 检查限流 (按 peer_id + info_hash)
     Note over T: 查索引: info_hash → [peer_id 列表]
     Note over T: 按 limit 截取, 排除已下线/过期
     loop 对每个候选 peer
         Note over T: 生成一次性 connection_id (随机)
-        Note over T: 记录 connection_id → (A, B, info_hash, ts)
-        Note over T: 签发 connect JWT (scope=connect,<br/>sub=A, target_peer_id=B,<br/>info_hash, connection_id=jti, exp=数十秒)
+        Note over T: 签发 connect JWT (scope=connect,<br/>sub=A, target_peer_id=B, info_hash,<br/>connection_id=jti, exp=iat+60s,<br/>grace_until=iat+900s)
     end
+    Note over T: 不写 connection 记录 —— 授权信息全部自包含在 JWT 内
     T-->>A: {peers: [{peer_id, public_key, punch_server, punch_public_key, connect_jwt}, ...], next_cursor}
     Note over A: 用 connect JWT 向 B 的 Punch Server 发起 signal<br/>connect JWT 过期后需重新 query
 ```
 
 **为什么 Tracker 签发 connect JWT 而不是直接返回 B 的地址**：Tracker 只做发现和授权，不做转发。A 拿到 connect JWT 后直接联系 B 所在的 Punch Server，Punch B 验 JWT 后才转发信令。这样 Tracker 不在数据路径上，也不持有 A/B 的网络地址。
 
-**为什么 connection_id = JWT 的 jti**：`jti`（JWT ID）是 JWT 规范里的一次性标识，Punch B 消费这个 jti 后就不再接受同一 jti 的请求——天然防重放。同时 Tracker 记录 `connection_id → (A, B, info_hash)` 作为后续 `relay_credentials` 的授权依据。
+**为什么 connection_id = JWT 的 jti**：`jti`（JWT ID）是 JWT 规范里的一次性标识，Punch B 消费这个 jti 后就不再接受同一 jti 的请求——天然防重放。
 
-##### `POST /connections/{connection_id}/relay` — relay_credentials
+**为什么 Tracker 不再记录 connection_id**：授权所需的全部信息（`sub`、`target_peer_id`、`info_hash`、`connection_id`）都已签进 JWT，Tracker 只需验签即可完成 `relay_credentials` 授权。保留一份短命记录既带来写放大（一次 `query` 返回 N 个候选就要写 N 条），又要求多实例间共享它（见 7.1 节），还引入了"记录 TTL 与 ICE 超时谁先到期"的时序耦合——relay 回退发生在 ICE 超时之后，任何以"连接建立超时"为 TTL 的记录都在那一刻已过期。去掉记录后，一次性消费语义仍由 Punch Server 侧的 `jti` 记录保证：**Punch 管 jti，Tracker 管签名与授权**。
+
+##### `POST /connections/relay` — relay_credentials
 
 请求 TURN 中继凭据。携带 session JWT。
 
 | 请求字段 | 类型 | 说明 |
 | --- | --- | --- |
-| `connection_id` | string | 来自 connect JWT 的 `jti` |
+| `connect_jwt` | string | query 返回的 connect JWT 本体（完整序列化字符串） |
 
 | 响应字段 | 类型 | 说明 |
 | --- | --- | --- |
@@ -637,7 +685,7 @@ sequenceDiagram
 | `turn_servers` | string[] | TURN 服务器列表 |
 | `expires_at` | int64 | 凭据过期时间 |
 
-**授权与限制**：仅连接双方；按签发记录校验 `sub` 与 `connection_id` 记录，并检查配额。
+**授权与限制**：仅连接双方；校验 connect JWT 本体（签名有效、`sub` 或 `target_peer_id` 之一 == 请求方身份、`info_hash` 未封禁、`now <= grace_until`——**不检查** `exp`，理由见 3.4.1 节），并检查配额。Tracker **可以**对 `(connection_id, 用途)` 做一次性消费记录，以防宽限窗内反复取凭据。
 
 **交互流程**：
 
@@ -647,9 +695,9 @@ sequenceDiagram
     participant T as Tracker
 
     Note over A: 直连 ICE 失败, 决定走 TURN
-    A->>T: POST /connections/{connection_id}/relay<br/>Authorization: Bearer <jwt>
+    A->>T: POST /connections/relay<br/>Authorization: Bearer <jwt>
     Note over T: 验 session JWT
-    Note over T: 查 connection_id 记录: sub == A? 对端 == B? 记录过期?
+    Note over T: 验 connect JWT 本体: 签名? sub/target 含 A?<br/>info_hash 未封禁? now <= grace_until? (不查 exp)
     Note over T: 检查 TURN 配额 (带宽/连接数/时长)
     Note over T: 生成短期 TURN REST 凭据:<br/>username = "expiry_timestamp:peer_id"<br/>password = HMAC(turn_secret, username)
     Note over T: 记录凭据发放 (计费/审计)
@@ -659,7 +707,7 @@ sequenceDiagram
 
 **为什么 A 和 B 各自请求**：TURN REST 凭据是 per-peer 的——用户名里编码了 peer_id，TURN 服务器按 peer_id 计费和限流。A 和 B 拿到的是各自的凭据，不是共享的。
 
-**为什么 Tracker 记录 connection_id**：`relay_credentials` 的授权依据是 Tracker 在 `query` 时签发的 `connection_id → (A, B, info_hash)` 记录。只有该记录里的双方才能请求 relay 凭据，防止第三方滥用。
+**为什么不查记录而验 JWT 本体**：relay 回退发生在 ICE 超时之后，此时任何以"连接建立超时"为 TTL 的记录都已过期——依赖记录会让回退在最需要它的场景（对称 NAT / CGNAT 打洞失败）失效。connect JWT 本身已是不可伪造的授权凭据，验签 + 校验 `sub` / `target_peer_id` / `info_hash` / `grace_until` 即可确定"请求方曾被授权连接这个资源"，无需任何服务端状态。
 
 #### 7.2.2 Punch RPC 接口
 
@@ -682,7 +730,7 @@ Punch Server 上的接口走加密认证信道（非 REST），以 RPC 风格的
 | `binding_key` | string | 会话级对称密钥（HMAC 用） |
 | `expires_at` | int64 | Binding 过期时间 |
 
-**授权与限制**：JWT + 持钥证明；punch JWT 的 `jti` 一次性消费（Punch Server 维护已消费 `jti` 记录，覆盖 punch JWT `exp` 两倍时长）；`peer_id` 未被吊销；新 binding 替换旧 binding。客户端重连或 binding 过期时需重新 `login` 获取新 punch JWT。
+**授权与限制**：JWT + 持钥证明；punch JWT 的 `jti` 一次性消费（Punch Server 维护已消费 `jti` 记录，覆盖 punch JWT `exp` 两倍时长）；`peer_id` 未被吊销（`iat > revoked_at`）；新 binding 替换旧 binding。客户端重连或 binding 过期时需重新 `login` 获取新 punch JWT。
 
 **交互流程**：
 
@@ -925,7 +973,7 @@ sequenceDiagram
 | `SendLoginReq` / `OnLoginRsp` | client ↔ Tracker | `POST /sessions` | 提交签名，rsp 含 session JWT、punch JWT、Punch Server 分配（地址与公钥）与 STUN/TURN 配置 |
 | `SendAnnounceReq` / `OnAnnounceRsp` | client ↔ Tracker | `PUT /peers/{peer_id}/resources` | `add` / `del` 批量登记与撤下资源 |
 | `SendQueryReq` / `OnQueryRsp` | client ↔ Tracker | `GET /resources/{info_hash}/peers` | rsp 含候选 Peer 的 `peer_id`、公钥、Punch 地址与公钥及 connect JWT |
-| `SendRelayCredentialsReq` / `OnRelayCredentialsRsp` | client ↔ Tracker | `POST /connections/{connection_id}/relay` | rsp 仅含请求方自身的 relay 凭据 |
+| `SendRelayCredentialsReq` / `OnRelayCredentialsRsp` | client ↔ Tracker | `POST /connections/relay` | 请求体携带 connect JWT 本体；rsp 仅含请求方自身的 relay 凭据 |
 
 #### 7.3.2 Punch 通信接口
 
@@ -950,7 +998,7 @@ sequenceDiagram
 
 #### 7.3.3 Peer 通信接口
 
-Peer 之间的消息是对称、单向的，没有控制面那种请求-响应对，因此函数不带 Req / Rsp 后缀。`bitfield`、`have`、`request`、`reject`、`cancel`、`request_info`、`info` 走控制通道（reliable + ordered），`piece` 走数据通道（unreliable + unordered，`maxRetransmits = 0`）；连接建立与断线重连属信道层（ICE / DTLS），不占业务函数。
+Peer 之间的消息是对称、单向的，没有控制面那种请求-响应对，因此函数不带 Req / Rsp 后缀。`bitfield`、`have`、`request`、`reject`、`chunk_nack`、`piece_done`、`cancel`、`request_info`、`info` 走控制通道（reliable + ordered），`chunk` 走数据通道（unreliable + unordered，`maxRetransmits = 0`，1024 字节/条）；连接建立与断线重连属信道层（ICE / DTLS），不占业务函数。
 
 | 函数 | 方向 | 说明 |
 | --- | --- | --- |
@@ -958,9 +1006,11 @@ Peer 之间的消息是对称、单向的，没有控制面那种请求-响应�
 | `SendRequestInfo` / `OnRequestInfo` | 缺 info 方 → 对端 | magnet 模式：bitfield 交换前发起 |
 | `SendInfo` / `OnInfo` | 对端 → 请求方 | info 字节串；接收方校验 `SHA-256 == info_hash` 后使用 |
 | `SendHave` / `OnHave` | A ↔ B | 每验证一个 block 广播给所有已连接 Peer |
-| `SendRequest` / `OnRequest` | 下载方 → 上传方 | 在途窗口内；响应为 `piece` 或 `reject` |
-| `SendPiece` / `OnPiece` | 上传方 → 下载方 | 数据本体，走数据通道 |
-| `SendReject` / `OnReject` | 上传方 → 下载方 | 按单个请求粒度拒绝；下载方退避或转投 |
+| `SendRequest` / `OnRequest` | 下载方 → 上传方 | 在途窗口内；响应为 `chunk` 流或 `reject` |
+| `SendChunk` / `OnChunk` | 上传方 → 下载方 | 数据本体，1024 字节/条，走数据通道 |
+| `SendChunkNack` / `OnChunkNack` | 下载方 → 上传方 | 批量请求重传缺失 chunk |
+| `SendPieceDone` / `OnPieceDone` | 下载方 → 上传方 | 收齐确认，上传方释放缓冲 |
+| `SendReject` / `OnReject` | 上传方 → 下载方 | 按单个请求粒度拒绝，含 `retry_after`；下载方必须遵守退避或转投 |
 | `SendCancel` / `OnCancel` | 下载方 → 上传方 | 撤销在途请求（endgame / 转投） |
 
 ## 8. 安全性考量
@@ -975,7 +1025,7 @@ Peer 之间的消息是对称、单向的，没有控制面那种请求-响应�
 - 只靠 `scope=connect`、却不校验 `aud` 与 `target_peer_id`：一张泄露票据可被拿去联系其他 Punch 节点或其他 Peer，权限范围过大。
 - 没有 `exp`、`jti`：截获的连接请求可在很久以后无限重放。
 - 没有独立的 TURN 授权与配额：攻击者可把 TURN 当开放代理消耗带宽，造成高额成本与滥用风险。
-- 没有密钥吊销机制：私钥泄露后，攻击者持有私钥即可持续 login 获取新 session JWT，短 `exp` 只能限制单次会话窗口，无法阻止冒充。本设计通过 revocation token（第 3.1.4 节）解决——撤销的是 peer_id 本身（从 Tracker 注册表标记为吊销），此后该 peer_id 的 login / join 全部拒绝，攻击者即使持有私钥也无法重新获取 session JWT。要求客户端妥善备份 token；token 丢失时只能等 register TTL（默认 90 天）过期，期间身份仍可被冒充。
+- 没有密钥吊销机制：私钥泄露后，攻击者持有私钥即可持续 login 获取新 session JWT，短 `exp` 只能限制单次会话窗口，无法阻止冒充。本设计通过 revocation token（第 3.1.4 节）解决——吊销是**永久**状态：写入 `revoked_keys`、删除注册记录、记录 `revoked_at`，此后该 `peer_id` 的 login / join 全部拒绝（判据统一为 `iat > revoked_at`），攻击者即使持有私钥也无法重新获取 session JWT。要求客户端妥善备份 token；token 丢失时无法吊销，因此实现**可以**额外提供 Tracker 签发的 revoke credential 作为备份路径。
 
 ### 8.2 数据面
 
