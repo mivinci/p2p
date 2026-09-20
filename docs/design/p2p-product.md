@@ -4,6 +4,8 @@
 | --- | --- |
 | 规划稿（Draft） | 2026-09-20 |
 
+> 变更摘要：2026-09-20 起数据面改为 Merkle 证明校验，种子格式 `v: 2`，CDN 兜底需配套 `proof_list`（协议 §4.2.1 / §5.1）；风险表新增 TURN 开放中继技术债、relay 占比与有效 seeder 供给三项。
+
 ## 1. 产品定位
 
 一句话：**P2P 基础设施 + SDK，运营一套统一公共网络**。核心卖点是服务端不碰内容、带宽成本摊给用户网络。
@@ -24,7 +26,7 @@
 
 | 组件 | 职责 | 为什么不能复用 |
 | --- | --- | --- |
-| **Tracker Server** | 控制面核心：身份注册表、资源索引（announce / query）、connection 记录、JWT 签发、nonce / jti 一次性语义、revocation（§7.2.1） | 协议完全自定义（Ed25519 身份 + JWT 授权 + info_hash 索引），BT tracker 不适用 |
+| **Tracker Server** | 控制面核心：身份注册表、资源索引（announce / query）、JWT 签发、nonce 一次性语义、revocation（§7.2.1）；connection 授权已无状态化，不存连接记录 | 协议完全自定义（Ed25519 身份 + JWT 授权 + info_hash 索引），BT tracker 不适用 |
 | **Punch Server** | 信令中继：Binding 维护（join / heartbeat / exit）、常驻与瞬时信道、signal_key 断线恢复、connect JWT 的 jti 消费、容量控制（§7.2.2） | 自定义信令中继，比 STUN/TURN 复杂，无现成组件 |
 | **Client SDK** | 身份管理 + 控制面通信 + WebRTC 数据面拼装（§7.3 三张函数面表格的完整实现） | 最大的工程量，见第 3 节 |
 
@@ -48,8 +50,8 @@ SDK 是**最重的交付物**，文档 §7.3 的函数面表格只是接口骨�
 
 - 身份管理：Ed25519 密钥对、peer_id 派生、revocation token 生成
 - Punch 信道层：常驻 Binding 信道 + 瞬时信令信道 + `signal_key` 断线恢复
-- WebRTC 数据面：双 DataChannel、block / piece 状态机（missing → partial → downloaded → verified）、bitfield / have、request / reject / cancel、顺序窗口 + rarest first + endgame 调度、magnet 模式、TURN 回退
-- 文件 I/O：in-place 写盘、块哈希校验、bitmap 持久化
+- WebRTC 数据面：双 DataChannel、block / piece / chunk 三层状态机（missing → partial → downloaded → verified）、bitfield / have、request / reject / pause / resume / cancel、Merkle 树构造与证明校验（§4.2.1，含批量证明）、顺序窗口 + rarest first + endgame 调度、magnet 模式、TURN 回退
+- 文件 I/O：in-place 写盘、Merkle 证明校验、bitmap 持久化
 
 | 平台 | 语言 | 说明 |
 | --- | --- | --- |
@@ -57,7 +59,7 @@ SDK 是**最重的交付物**，文档 §7.3 的函数面表格只是接口骨�
 | iOS | Swift + WebRTC.framework | 原生 WebRTC 封装 |
 | Android | Kotlin + libwebrtc | 原生 WebRTC 封装 |
 | 桌面 | Electron（复用 JS）或原生 | 视目标用户决定 |
-| 服务端 / 种子源托管 | Go / Rust | CDN 兜底虚拟 Peer（§5.1 `cdn_list`）的托管实现 |
+| 服务端 / 种子源托管 | Go / Rust | CDN 兜底虚拟 Peer（§5.1 `cdn_list`）与其配套的 `proof_list` 托管（含种子生成工具：切块、建树、生成叶子哈希列表） |
 
 ## 4. 实施路径（MVP）
 
@@ -85,7 +87,10 @@ Phase 4：公共网络规模运营（多活扩容、SLA、滥用治理、合规�
 | 协议演进 | 版本化 schema 定义了机制但未定义治理 | Phase 2 定协议版本策略 |
 | 信任根运营 | 全网身份注册表与授权签发握在运营方，是全网信任根 | KMS 级密钥管理、公开公钥、可审计运营（§8 信任模型限定破坏半径） |
 | 滥用与合规 | 公共网络 info_hash 索引可能传播盗版 / 恶意文件 | Tracker 不存内容（仅哈希索引）、配合特定 info_hash 下架、服务条款明确网络内容与运营方无关 |
-| 冷启动 | 网络规模上来前 P2P 比例低 | SDK 自带 CDN 兜底（§5.1 `cdn_list`），冷启动靠 CDN，规模上来后 P2P 比例自然上升 |
+| 冷启动 | 网络规模上来前 P2P 比例低 | SDK 自带 CDN 兜底（§5.1 `cdn_list`），规模上来后 P2P 比例自然上升。**注意配套**：Merkle 化后 CDN 必须同时提供 `proof_list`，否则 CDN 数据无法进入 verified 状态，兜底链路是断的 |
+| TURN 开放中继（技术债） | coturn 无 per-allocation 对端约束，TURN 可被转发到任意地址 | Phase 1 接受，靠短期凭据 + per-peer 配额 + 审计抑制；是否投入前置网关由实测 relay 占比决定（§4.7） |
+| relay 占比与成本 | 对称 NAT / CGNAT 下直连失败的比例未知，relay 带宽由运营方承担 | Phase 1 实测直连成功率与 relay 占比；占比高则成本模型从"用户摊带宽"滑向"运营方付带宽"，需重算第 9 节 |
+| 有效 seeder 供给 | 移动端后台不能保活、浏览器关页即掉线，DAU ≠ 有效 seeder 数 | 同期实测各平台平均做种时长；渗透率假设（§9）按有效 seeder 而非 DAU 估 |
 
 ## 6. 商业形态
 
