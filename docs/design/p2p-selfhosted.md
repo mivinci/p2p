@@ -4,7 +4,9 @@
 | --- | --- |
 | 提案（RFC，未定案） | 2026-09-21 |
 
-> **本文的定位**：本文是 `p2p-technical.md`（下称"既有设计"）的一次**定位级改版提案**，不是补丁。第 9 章另外给出服务形态与计费边界（开源实现 + 托管 PaaS，我们不托管网络的数据）。2026-09-21 补入桶凭据的授予与撤销机制（3.6 节），并据此把安全边界从"路径前缀"改为"桶"（2.1 节）——推荐一网络一桶。既有设计隐含"由单一运营方提供一张全局 P2P 网络"的假设——Tracker 是信任根、状态存在 Tracker 自己手里、运营方承担带宽与中继成本。本文把假设换成：**任何人都可以创建一个 P2P 网络，网络的权威状态存放在创建者自己的对象存储（桶）里**。
+> **本文的定位**：本文是 `p2p-technical.md`（下称"既有设计"）的一次**定位级改版提案**，不是补丁。第 9 章另外给出服务形态与计费边界（开源实现 + 托管 PaaS，我们不托管网络的数据）。2026-09-21 补入桶凭据的授予与撤销机制（3.8 节），并据此把安全边界从"路径前缀"改为"桶"（2.1 节）——推荐一网络一桶。同日重做桶对象布局（3.1 节）：实体与关系分离，announcement 边独立成树并支持 tombstone / generation；存储被抽象为 `MetadataStore` + `BlobStore` 逻辑键空间（3.2 节），S3 只是默认后端。
+
+既有设计隐含"由单一运营方提供一张全局 P2P 网络"的假设——Tracker 是信任根、状态存在 Tracker 自己手里、运营方承担带宽与中继成本。本文把假设换成：**任何人都可以创建一个 P2P 网络，网络的权威状态存放在创建者自己的对象存储（桶）里**。
 >
 > 数据面（ICE / DTLS / WebRTC DataChannel、block / piece / chunk、Merkle 证明、调度）几乎不变，本文只做摘要并指向既有设计；**变化集中在控制面与信任模型**。第 9 章给出服务形态与计费边界，第 11 章给出 v2 → v3 的完整差异清单，第 12 章列出尚未定案的问题。
 
@@ -73,12 +75,12 @@ network_id = "s3://my-bucket"
 
 这样定义的好处是它自解释、无需额外哈希、客户端拿到就能定位权威状态；代价是**换桶等于换网络**（需要重新分发种子），这是可接受的——换存储位置本来就是重建网络级别的操作。
 
-**安全边界是桶，不是路径前缀。** 桶内的 `net/` 与 `files/` 只是固定的对象布局，不承担隔离职责。原因是并非所有 S3 兼容存储都支持前缀级策略：AWS S3 / MinIO / 腾讯云 COS 可以，但 Cloudflare R2 的 API token 粒度是**桶级**（读 / 写 / 列表），没有前缀条件。因此：
+**安全边界是桶，不是路径前缀。** 桶内的 `resources/` / `peers/` / `announcements/` 等只是固定的对象布局，不承担隔离职责。原因是并非所有 S3 兼容存储都支持前缀级策略：AWS S3 / MinIO / 腾讯云 COS 可以，但 Cloudflare R2 的 API token 粒度是**桶级**（读 / 写 / 列表），没有前缀条件。因此：
 
 - 推荐形态是**一网络一桶**——桶即权限边界，在任何兼容存储上都能得到一致的隔离强度；
-- 若在同一桶内用不同前缀承载多个网络（`network_id = "s3://my-bucket/net/demo"`），则**必须**在存储侧用策略强制该前缀，否则这些网络之间不存在任何隔离保证。这只应在确认目标存储支持前缀级策略时使用，且**不得**在文档中把它当作默认形态。
+- 若在同一桶内用不同前缀承载多个网络（`network_id = "s3://my-bucket/demo"`），则**必须**在存储侧用策略强制该前缀，否则这些网络之间不存在任何隔离保证。这只应在确认目标存储支持前缀级策略时使用，且**不得**在文档中把它当作默认形态。
 
-桶里必须存在一份网络描述符 `net/descriptor.json`：
+桶里必须存在一份网络描述符 `descriptor.json`：
 
 ```text
 {
@@ -86,7 +88,7 @@ network_id = "s3://my-bucket"
   network_id: "s3://my-bucket"
   name: "...", description: "..."        展示用
   created_at: <unix seconds>
-  seq: <u64>                             单调递增，防回滚（见 3.6.4 节）
+  seq: <u64>                             单调递增，防回滚（见 3.8.4 节）
   creator_public_key: <32B>              创建者公钥，用于验签本文件与 trackers.json
   signature: <64B>                       sign(creator_key, canonical(本文件除 signature 外))
 }
@@ -104,13 +106,13 @@ network_id = "s3://my-bucket"
 
 | 能力 | 归属 |
 | --- | --- |
-| 决定谁能当 Tracker | 创建者（`net/trackers.json`） |
+| 决定谁能当 Tracker | 创建者（`trackers/manifest.json`） |
 | 选择 / 部署 Punch 与 TURN | 基础设施管理面（PaaS 控制面或自建维护者），不属于网络桶 |
 | 吊销某个 peer | 创建者（直接改桶）或 Tracker（代写） |
-| 签发票据 | Tracker（用 `net/trackers.json` 里的密钥） |
-| 撤销某个 Tracker | 创建者（从 `net/trackers.json` 移除 + 撤销其桶授权，见 3.6 节） |
+| 签发票据 | Tracker（用 `trackers/manifest.json` 里的密钥） |
+| 撤销某个 Tracker | 创建者（从 `trackers/manifest.json` 移除 + 撤销其桶授权，见 3.8 节） |
 
-后果是**Tracker 作恶的破坏半径变小了**：它不能篡改创建者未授权给它写的对象（见 3.5 节的权限矩阵与 3.6 节的强制方式），也不能阻止创建者把它踢掉。这是 self-hosted 模型相对单租户模型最实质的安全收益。
+后果是**Tracker 作恶的破坏半径变小了**：它不能篡改创建者未授权给它写的对象（见 3.7 节的权限矩阵与 3.8 节的强制方式），也不能阻止创建者把它踢掉。这是 self-hosted 模型相对单租户模型最实质的安全收益。
 
 ### 2.3 客户端如何加入一个网络
 
@@ -119,8 +121,8 @@ network_id = "s3://my-bucket"
 ```text
 种子文件 = bencode({
   tracker_list: ["https://t1.example.com", "https://t2.example.com"]   该网络的 Tracker，可多个
-  cdn_list:     ["https://my-bucket.s3.amazonaws.com/net/demo/files/x.iso"]
-  proof_list:   ["https://my-bucket.s3.amazonaws.com/net/demo/files/x.iso.hashes"]
+  cdn_list:     ["https://my-bucket.s3.amazonaws.com/resources/<resource_id>/data"]
+  proof_list:   ["https://my-bucket.s3.amazonaws.com/resources/<resource_id>/hashes"]
   leaf_hashes:  <bytes>                                    可选，内联叶子哈希列表
   info: { v: 2, name, length, block_size, piece_size, mime, root }
 })
@@ -128,13 +130,13 @@ network_id = "s3://my-bucket"
 
 `cdn_list` 与 `proof_list` 默认指向桶——这是本模型与既有设计的自然契合点：创建者把文件放进桶，桶同时就是冷启动的 CDN 源与证明源，全网零 seeder 也能工作（既有设计 §5.1 的 `proof_list` 硬约束在此变成默认形态）。
 
-一个 `info_hash` 在多个网络中是相同的（它只是内容的哈希），因此**同一份内容可以在不同网络间被发现**——跨网络互通是未来可做的能力，本文不定义。
+`resource_id` 即既有设计的 `info_hash`（3.1 节），因此它在多个网络中是相同的；**同一份内容可以在不同网络间被发现**——跨网络互通是未来可做的能力，本文不定义。桶内对应的权威内容对象为 `resources/<resource_id>/data`，证明源为 `resources/<resource_id>/hashes`。
 
 ### 2.4 网络生命周期
 
 | 阶段 | 动作 |
 | --- | --- |
-| 创建 | 创建者建桶、写 `net/descriptor.json`、放文件与叶子哈希列表、向 Tracker 与 Punch 授权 |
+| 创建 | 创建者建桶、写 `descriptor.json`、放文件与叶子哈希列表、向 Tracker 与 Punch 授权 |
 | 运营 | 创建者增删 Tracker / Punch、查看统计、封禁 peer（写吊销分片） |
 | 迁移 | 换桶 = 新 `network_id`，需重新分发种子；旧网络可保留只读一段时间 |
 | 消亡 | 创建者删除桶即可；客户端表现为"网络不可用"，**应当**给出明确错误而非静默重试 |
@@ -143,79 +145,223 @@ network_id = "s3://my-bucket"
 
 ### 3.1 对象布局
 
+推荐形态是一网络一桶，因此桶内不再需要 `net/` 之类的网络前缀。本文使用**实体 / 关系分离**的布局：
+
 ```text
-net/descriptor.json                          网络描述符（创建者签名，根信任锚）
-net/trackers.json                            授权 Tracker 公钥集合（JWKS，创建者签名）
-net/revocations/manifest.json                吊销分片清单 + 各分片 ETag
-net/revocations/<shard>.json                 吊销记录（按 SHA-256(public_key) 首字节分片）
-net/peers/<peer_id>.json                     身份注册（含 public_key、expires_at）
-net/resources/<info_hash>/<peer_id>.json     资源声明（complete、expires_at）
-files/<hh>/<info_hash>                       文件字节（CDN 源）
-files/<hh>/<info_hash>.hashes                叶子哈希列表（proof_list 目标）
+descriptor.json                              网络描述符（创建者签名，根信任锚）
+
+resources/<resource_id>/info                 资源实体：canonical 字节，参与 resource_id
+resources/<resource_id>/data                 资源内容字节（CDN 源，可选）
+resources/<resource_id>/hashes               Merkle leaf hashes（proof_list 目标）
+resources/<resource_id>/display.json         展示元数据，不参与 resource_id（可选）
+resources/manifest.json                      资源清单与 seq，便于浏览 / 审计（可选）
+
+peers/<peer_id>/info.json                    Peer 实体：public_key、注册状态、generation
+
+announcements/<resource_id>/<peer_id>.json   Peer ↔ Resource 的当前声明边
+
+trackers/manifest.json                       授权 Tracker issuer 集合（kid / public_key / seq）
+
+revocations/manifest.json                    吊销分片清单 + 各分片版本 / ETag
+revocations/<shard>.json                     吊销记录（按 SHA-256(public_key) 前两个十六进制字符分片）
 ```
 
-`<hh>` 为 `info_hash` 前两个十六进制字符，用于打散前缀、避免单前缀热点。
+`resource_id` 仍等于既有设计的 `info_hash`：
 
-### 3.2 读写频率分层
+```text
+resource_id = SHA-256(canonical(info bytes))
+```
+
+其中 `resources/<resource_id>/info` **必须**是稳定的 canonical 编码（bencode / CBOR canonical form 等），**不得**因为 JSON 字段顺序、空白或数值表示差异导致身份漂移；需要人类可读字段时放 `display.json`，不参与身份。
+
+`announcements/` 单独成树的原因：Resource 与 Peer 都是独立实体，二者的关系不应被塞进任一实体的子目录；边的属性、tombstone、GC、未来上传统计都属于关系层，不应污染实体对象。
+
+REST 路径与桶内路径的映射（见 5.2 节）保持客户端视角：
+
+```text
+PUT /peers/{peer_id}/resources          → announcements/<resource_id>/<peer_id>.json
+GET /resources/{resource_id}/peers      → LIST announcements/<resource_id>/
+```
+
+### 3.2 逻辑键空间与可替换存储后端
+
+上述对象布局是**协议的逻辑键空间**，不是 S3 专属 schema。实现**不得**在 Tracker 业务逻辑里直接拼 S3 object key，而应构造逻辑键，再由存储后端映射。
+
+协议只要求两个能力集：
+
+```rust
+trait MetadataStore {
+    async fn get(&self, key: MetadataKey) -> Result<Option<VersionedBytes>>;
+    async fn put_if_version(
+        &self,
+        key: MetadataKey,
+        value: Bytes,
+        expected: ExpectedVersion,
+    ) -> Result<Version>;
+    async fn delete_if_version(&self, key: MetadataKey, expected: ExpectedVersion) -> Result<()>;
+    async fn scan_prefix(
+        &self,
+        prefix: MetadataPrefix,
+        cursor: Option<Cursor>,
+    ) -> Result<Page<MetadataEntry>>;
+}
+
+trait BlobStore {
+    async fn get_range(&self, key: BlobKey, range: Range<u64>) -> Result<Bytes>;
+    async fn put_stream(&self, key: BlobKey, data: impl AsyncRead) -> Result<()>;
+}
+```
+
+元数据与大对象拆开的原因是能力需求不同：Peer / Resource / Announcement / Revocation 需要小记录、CAS 与 prefix scan；`resources/<id>/data` 与 `hashes` 需要 Range GET、流式读取和 CDN 分发。
+
+逻辑键到后端的映射：
+
+| 后端 | `MetadataStore` | `BlobStore` |
+| --- | --- | --- |
+| S3 / R2 / MinIO / COS（默认） | 逻辑 key → object key；条件写 + LIST prefix | 同一桶的 range read / streaming |
+| RocksDB / SQLite | 逻辑 key → byte key；事务或 CAS wrapper + iterator | 通常外接对象存储 |
+| SlateDB | KV record + scan（注意其 single-writer 语义） | 通常仍接对象存储 |
+| DynamoDB | item + conditional update + query | 不适合大 blob，外接 S3 |
+
+协议语义**不得**交给后端猜测：`expires_at`、`generation`、`state` 都是记录内的字段，Tracker 读取后自行判定；后端只负责持久化和版本化。
+
+无论采用哪个后端，产品口径不变：
+
+- 默认实现是创建者自己的对象存储，因此数据主权归创建者；
+- PaaS 中的 Redis / RocksDB / SlateDB 只能是**可重建的物化视图或加速器**，不得成为网络唯一真相；
+- 迁移后端时 `resource_id`、`peer_id`、种子与协议行为不变。
+
+### 3.3 读写频率分层
 
 桶适合"低频、大、权威、可缓存"的数据。**决定成败的设计约束是：不要把高频写放进桶。**
 
 | 数据 | 频率 | 放哪 | 理由 |
 | --- | --- | --- | --- |
-| 文件字节、`*.hashes` | 写一次，读很多 | 桶 | 天然 CDN 缓存 |
-| `descriptor` / `trackers` | 极低频写，高频读 | 桶 + CDN | 创建者控制面 |
+| `resources/<id>/data` / `hashes` | 写一次，读很多 | 桶 | 天然 CDN 缓存 |
+| `descriptor` / `trackers/manifest` | 极低频写，高频读 | 桶 + CDN | 创建者控制面 |
 | 吊销记录 | 极低频写，Tracker 高读 | 桶 + Tracker 缓存 | Tracker 停签新短票据；Punch 不读取网络撤销表 |
-| 身份注册 | 每 peer 每 90 天写一次，login 时读 | 桶 | 低频 |
-| 资源声明 | 每 peer 每 TTL 写一次 | 桶 | **TTL 必须足够长**，见 3.4 |
+| Peer 实体 | 每 peer 每 90 天写一次，login 时读 | 桶 | 低频 |
+| announcement 边 | 每 peer 每资源每 TTL 写一次 | 桶 | **TTL 必须足够长**，见 3.5 |
 | Punch 拓扑 / 健康 / 配额 | 管理面低频变更 + 高频探测 | **管理面 + Tracker 内存** | 基础设施状态，不属于网络桶 |
 | Binding / 在线状态 | 每 peer 每 10–30 min 刷新 | **Punch 内存** | 绝不能进桶 |
 | `jti` 一次性消费 | 每次连接 | **Punch 内存** | `aud` 已绑定单实例 |
 | login nonce | 每次 login | **无状态**（见 4.4） | 不做存储 |
 | 限流计数 | 每请求 | **Tracker 内存**（可丢失） | 见 7.3 |
 
-### 3.3 一致性、并发与原子性
+### 3.4 一致性、并发与原子性
 
 现代对象存储对 PUT / GET / LIST 都是写后读一致（S3 自 2020 年起，R2、MinIO 等同样），因此"Tracker 写完，后续任一 Tracker 立刻能读到"成立。仍需注意：
 
 1. **没有事务**。跨对象的原子性不存在，只能靠对象拆分规避。
-2. **覆盖是 last-writer-wins**。因此**资源索引必须拆成"每 peer 一对象"**——若做成单对象并发追加，两个 peer 同时 announce 会互相覆盖。
-3. **条件写可用**：`If-None-Match: *` 可实现"不存在才写"（原子创建），`If-Match: <ETag>` 可实现乐观锁。这两者足以实现吊销记录的幂等写入。
-4. **LIST 分页**：`net/resources/<info_hash>/` 下可能有数万个对象，query **必须**分页（每次 1000 key）并**应当**在 Tracker 侧做短 TTL 缓存。
+2. **覆盖是 last-writer-wins**。因此**announcement 边必须拆成"每 (resource, peer) 一对象"**：既避免不同 Peer 并发 announce 互相覆盖，也避免同一 Peer 的批量 add / del 在重试与乱序下互相破坏。
+3. **条件写可用**：`If-None-Match: *` 可实现"不存在才写"（原子创建），`If-Match: <ETag>` 可实现乐观锁。这两者足以实现 announcement 边与吊销记录的幂等写入。
+4. **LIST 分页**：`announcements/<resource_id>/` 下可能有数万个对象，query **必须**分页（每次 1000 key）并**应当**在 Tracker 侧做短 TTL 缓存。
 5. **无监听机制**（对象存储没有 watch），Tracker **应当**轮询或按请求刷新桶对象。Punch 不直接访问桶或 Tracker；它只验证控制集群静态配置的 admission authority 公钥（5.5 与 7.5 节）。
 
-### 3.4 成本与容量约束
+#### 3.4.1 announcement 边是状态对象，不是事件日志
+
+`announcements/<resource_id>/<peer_id>.json` **必须**是某 Peer 对某资源的**当前**声明状态，而非追加的事件流：
+
+```text
+{
+  v: 1
+  state: "present" | "deleted"
+  complete: <bool>
+  announced_at: <unix seconds>
+  expires_at: <unix seconds>
+  generation: <u64>
+}
+```
+
+- `generation` 由 Peer 每次更新该边时递增；Tracker 仅在 `generation` 大于当前对象值时接受 `add`，小于当前值则拒绝，避免迟到的旧 announce 复活旧状态。
+- `del` **应当**先写 `state = "deleted"` 的 tombstone，而不是立即物理删除；后台 GC 在保留期过后才清理。这样迟到的旧 `add` 不会把已删除的关系重新写回来。
+- 有效边的判定是：`state == "present"` 且 `expires_at > now`。TTL 到期是逻辑失效，不要求立即删对象。
+- `resource_id` 与 `peer_id` 已由路径表达，边对象内**不得**重复保存资源或 Peer 实体字段，避免双写不一致。
+
+### 3.5 成本与容量约束
 
 对象存储按请求计费（GET 约 $0.4/百万，PUT/LIST 约 $5/百万），量级比数据库贵、比带宽便宜。控制成本的三条硬约束：
 
-1. **资源声明的 TTL 不得过短**。既有设计的 `ttl: 1800`（30 分钟）在桶模型下会产生显著写放大（1 万 peer 即 33 次写/秒，约 $430/月 的 PUT 费用）。本文建议 TTL **不低于 3 小时**，因为"是否在线"本就由 Punch 的 Binding 决定——**资源索引只表达"声明持有"，不表达"在线"**，失效的候选在 `signal` 阶段会被自然过滤掉。
+1. **announcement 边的 TTL 不得过短**。既有设计的 `ttl: 1800`（30 分钟）在桶模型下会产生显著写放大。真实写放大为：
+
+   ```text
+   object writes/s ≈ 活跃 peer 数 × 每 peer 平均宣告资源数 ÷ announce TTL
+   ```
+
+   例如 1 万 Peer、平均宣告 6 个资源、TTL 30 分钟：
+
+   ```text
+   10000 × 6 ÷ 1800 ≈ 33 writes/s   （约 $430/月 PUT）
+   ```
+
+   TTL 放宽到 3 小时后：
+
+   ```text
+   10000 × 6 ÷ 10800 ≈ 5.6 writes/s
+   ```
+
+   本文建议 TTL **不低于 3 小时**，因为"是否在线"本就由 Punch 的 Binding 决定——**announcement 边只表达"声明持有"，不表达"在线"**，失效的候选在 `signal` 阶段会被自然过滤掉。
 2. **Tracker 侧缓存索引 LIST 结果**（30–60 s），把 LIST 放大压到常数级。
 3. **Tracker 缓存吊销列表与描述符**，把高频读取压到常数级；Punch 的拓扑与 admission authority 由基础设施配置维护，不直接读取桶或 Tracker（5.5 与 7.5 节）。
 
 若网络规模大到这些约束不够用，应当引入一层缓存服务（Redis / 内存索引），但那属于优化；本文要求的是**默认配置下不触发**。
 
-### 3.5 桶凭据与最小权限
+### 3.6 Tracker 资源图与多实例边界
+
+桶保存的是所有**活跃 announcement 边**的权威集合；Tracker 的查询性能来自一个可重建的物化视图：
+
+```text
+resource_id → peers
+peer_id     → resources   （可选，仅本地管理 / 清理使用）
+```
+
+Rust 实现**应当**使用：
+
+```text
+HashMap + SlotMap / generational arena + EdgeId 双向邻接
+```
+
+而不是指针式十字链表；再配合一个按 `expires_at` 的最小堆做 TTL sweep。
+
+读写顺序**必须**是：
+
+```text
+写 / 删：先提交 bucket 权威对象，成功后才更新内存图，最后才向 Peer 返回成功
+读：先查内存图；资源处于 Unknown 时 singleflight 回源 bucket LIST 并 hydrate，再回答
+```
+
+因此内存图只是一个 write-through / read-through 的 materialized view：崩溃或分片接管后都能从 `announcements/<resource_id>/` 重建。
+
+单个 Tracker 是 self-hosted 的默认拓扑。多实例时不要求内存图实时一致；若采用 `rendezvous_hash(resource_id)` 让同一资源固定落到某个 owner shard，则：
+
+- `resource → peers` 可保持强一致视图；
+- `peer → resources` 天然跨 shard，不应作为跨集群强一致索引；
+- 扩缩容**不得**直接切换 hash ring，必须 handoff：旧 owner 服务 → 新 owner 从桶 hydrate → 栅栏 → 切换 `ring_epoch`；
+- 冷资源或接管 shard 的首次 query **必须**能回源桶，只允许变慢，不允许漏候选。
+
+### 3.7 桶凭据与最小权限
 
 凭据只发给服务端组件，**客户端永不得持有桶写凭据**。
 
 | 主体 | 权限 | 范围 |
 | --- | --- | --- |
 | 网络创建者 | 读写全部 | 整个桶 |
-| Tracker | **读写** | `net/peers/*`、`net/resources/*`、`net/revocations/*` |
-| Tracker | **不得** | `net/descriptor.json`、`net/trackers.json` |
+| Tracker | **读写** | `peers/*`、`announcements/*`、`resources/*`、`revocations/*` |
+| Tracker | **不得** | `descriptor.json`、`trackers/manifest.json` |
 | Punch | **无桶凭据** | 不直接访问桶或 Tracker；只验证控制集群配置的 admission authority 公钥 |
-| 客户端 | 只读（公开桶或预签名 URL） | `files/*` |
+| 客户端 | 只读（公开桶或预签名 URL） | `resources/*/data` |
 
-Tracker 不能改写"谁有权签发"这件事，是 2.2 节"Tracker 作恶破坏半径变小"的技术保证。授予与撤销的具体机制见 3.6 节。
+Tracker 不能改写"谁有权签发"这件事，是 2.2 节"Tracker 作恶破坏半径变小"的技术保证。授予与撤销的具体机制见 3.8 节。
 
-### 3.6 凭据的授予与撤销
+### 3.8 凭据的授予与撤销
 
-权限矩阵只是意图，需要存储侧机制把它变成强制约束。本节以 AWS S3 为基准描述，其他兼容存储按同等能力对齐（差异见 3.6.3 节）。
+权限矩阵只是意图，需要存储侧机制把它变成强制约束。本节以 AWS S3 为基准描述，其他兼容存储按同等能力对齐（差异见 3.8.3 节）。
 
-#### 3.6.1 授予：一网络一桶 + 桶级凭据（推荐形态）
+#### 3.8.1 授予：一网络一桶 + 桶级凭据（推荐形态）
 
 **推荐形态是每个网络独占一个桶，Tracker 持有该桶的读写凭据。** 先说清楚为什么不为 Tracker 做桶内最小权限：
 
-Tracker **本来就已经持有该网络的签名密钥**（4.3 节的 `kid` 私钥），凭它可以签发任意票据、冒充任意 peer。相比之下，桶内写权限带来的额外能力——改写或删除 `net/trackers.json` 等对象——**不构成实质权限扩大**：改写会被创建者签名挡下（3.6.4 节），删除只能造成可恢复的 DoS（创建者本地留有副本，重新上传即可）。为一个已经被更严重能力覆盖的威胁引入额外组件，复杂度与收益不成比例。
+Tracker **本来就已经持有该网络的签名密钥**（4.3 节的 `kid` 私钥），凭它可以签发任意票据、冒充任意 peer。相比之下，桶内写权限带来的额外能力——改写或删除 `trackers/manifest.json` 等对象——**不构成实质权限扩大**：改写会被创建者签名挡下（3.8.4 节），删除只能造成可恢复的 DoS（创建者本地留有副本，重新上传即可）。为一个已经被更严重能力覆盖的威胁引入额外组件，复杂度与收益不成比例。
 
 据此，最小权限的落点只有两处，且都很容易做到：
 
@@ -226,7 +372,7 @@ Tracker **本来就已经持有该网络的签名密钥**（4.3 节的 `kid` 私
 
 跨网络隔离才是这里真正要保的东西——一个 Tracker 进程同时服务多个网络，若共用桶则一份凭据可触及所有网络的数据；一网络一桶让这件事天然不成立。
 
-在此前提下，若目标存储支持前缀级授权，**可以**顺手加上 3.5 节的 Deny 约束（成本为零）；但**不得**为了在不支持它的存储上复现该约束而引入额外组件（如凭据代理）。
+在此前提下，若目标存储支持前缀级授权，**可以**顺手加上 3.7 节的 Deny 约束（成本为零）；但**不得**为了在不支持它的存储上复现该约束而引入额外组件（如凭据代理）。
 
 S3 上的具体做法（跨账号角色 + `ExternalId`）如下，其他存储按其自身机制对齐即可。创建者在自己的云账号里为每个网络建一个角色（如 `p2p-tracker-demo`），信任策略只认运营方，并带 `ExternalId`：
 
@@ -241,39 +387,39 @@ S3 上的具体做法（跨账号角色 + `ExternalId`）如下，其他存储�
 
 `ExternalId` **必须**设置——它防的是混淆代理（confused deputy）：没有它，运营方可以被诱导去 assume 属于别人的角色。
 
-权限策略用"宽 Allow + 窄 Deny"表达 3.5 节的矩阵：
+权限策略用"宽 Allow + 窄 Deny"表达 3.7 节的矩阵：
 
 ```json
 [ { "Effect": "Allow",
     "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
-    "Resource": "arn:aws:s3:::<bucket>/net/*" },
+    "Resource": "arn:aws:s3:::<bucket>/*" },
   { "Effect": "Allow",
     "Action": "s3:ListBucket",
     "Resource": "arn:aws:s3:::<bucket>",
-    "Condition": { "StringLike": { "s3:prefix": "net/*" } } },
+    "Condition": { "StringLike": { "s3:prefix": ["peers/*", "announcements/*", "resources/*", "revocations/*", "trackers/*"] } } },
   { "Effect": "Deny",
     "Action": ["s3:PutObject", "s3:DeleteObject"],
-    "Resource": ["arn:aws:s3:::<bucket>/net/descriptor.json",
-                 "arn:aws:s3:::<bucket>/net/trackers.json"] } ]
+    "Resource": ["arn:aws:s3:::<bucket>/descriptor.json",
+                 "arn:aws:s3:::<bucket>/trackers/manifest.json"] } ]
 ```
 
-Deny 优先，因此在 S3 上"Tracker 改不了谁有权签发"是**云厂商强制的**。但按上面的论证，这条约束属于纵深防御而非必需项：R2 等不支持前缀级授权的存储上可以不做，改由 3.6.4 节的创建者签名承担。
+Deny 优先，因此在 S3 上"Tracker 改不了谁有权签发"是**云厂商强制的**。但按上面的论证，这条约束属于纵深防御而非必需项：R2 等不支持前缀级授权的存储上可以不做，改由 3.8.4 节的创建者签名承担。
 
 **Punch 不得持有任何桶凭据，也不得与 Tracker 维持业务同步关系**：它只配置控制集群的 admission authority 公钥（5.5 与 7.5 节）。这样一台边缘 Punch 失守不会获得任何网络的对象读取面，也不会因服务多个网络而持有多份桶凭据、Tracker 地址或网络级策略。
 
 运行时：Tracker 按 `network_id` 调 AssumeRole 换取临时凭据，缓存在内存并自动刷新，**不得**落盘或写进配置文件。一个进程服务多个网络时持有多份凭据，按 `network_id` 索引。
 
-#### 3.6.2 初始化、撤销与审计
+#### 3.8.2 初始化、撤销与审计
 
-**初始化不走这个角色。** `net/descriptor.json`、`net/trackers.json` 是创建者行使主权的两个对象，**应当**由创建者用自己的凭据、通过本地 CLI 生成并上传，运营方压根不持有它们的写权限。运营期凭据只负责 `peers` / `resources` / `revocations`。Punch / TURN 拓扑由协议外的基础设施管理面维护。
+**初始化不走这个角色。** `descriptor.json`、`trackers/manifest.json` 是创建者行使主权的两个对象，**应当**由创建者用自己的凭据、通过本地 CLI 生成并上传，运营方压根不持有它们的写权限。运营期凭据只负责 `peers` / `resources` / `revocations`。Punch / TURN 拓扑由协议外的基础设施管理面维护。
 
 **撤销**即创建者删除角色或修改信任策略。已发出的临时凭据最多还能用到期为止，因此 **session duration 决定了撤销生效的延迟**，建议 15–60 分钟——这是安全性与 AssumeRole 调用频率之间的折中。
 
 **审计**：对象访问的审计日志（CloudTrail 数据面事件或等价能力）让创建者能看到 Tracker 的每一次读写。这既是"创建者可监督"的落地，也是 9.5 节"不留存"承诺的可验证性来源。
 
-**客户端**不参与这套机制：公开网络用桶策略开放 `files/*` 的匿名读；私有网络由 Tracker 用同一角色签发预签名 URL（短期、限定单个对象）。
+**客户端**不参与这套机制：公开网络用桶策略开放 `resources/*/data` 的匿名读；私有网络由 Tracker 用同一角色签发预签名 URL（短期、限定单个对象）。
 
-#### 3.6.3 不同存储的差异
+#### 3.8.3 不同存储的差异
 
 各类存储提供的是**四种不同的能力**，不要混为一谈：
 
@@ -286,23 +432,23 @@ Deny 优先，因此在 S3 上"Tracker 改不了谁有权签发"是**云厂商�
 
 四列里只有**第二列**（前缀级短期凭据）在不同存储上机制不同：S3 / MinIO / COS 由授权策略直接给出；R2 必须由父 token 调 `temp-access-credentials` 派生，而父 token 是桶级长期凭据——于是"Tracker 只拿前缀级凭据"需要长期持有一个桶级父凭据的签发组件才能持续。
 
-**本文不采用这条路线**（3.6.1 节已给出理由：Tracker 已持有签名密钥，桶内最小权限不是必需项）。因此这四种存储对本文的差别只落在两个可选加固项上：
+**本文不采用这条路线**（3.8.1 节已给出理由：Tracker 已持有签名密钥，桶内最小权限不是必需项）。因此这四种存储对本文的差别只落在两个可选加固项上：
 
-- **防删除**：S3 用版本控制 + MFA delete；R2 用 Bucket Locks（按前缀设 retention，阻止删除与覆盖，但不区分调用者——创建者更新时也需先移除规则）。这是签名唯一防不住的攻击面（3.6.4 节），创建者可按需要启用。
+- **防删除**：S3 用版本控制 + MFA delete；R2 用 Bucket Locks（按前缀设 retention，阻止删除与覆盖，但不区分调用者——创建者更新时也需先移除规则）。这是签名唯一防不住的攻击面（3.8.4 节），创建者可按需要启用。
 - **审计**：S3 的 CloudTrail 数据面事件可作依据；R2 的 Data Access Logs 官方声明为 best-effort，**只能用于事后对账，不得作为保证**。
 
 两者都不是正确性依赖，因此存储选型的自由度不受影响。
 
-#### 3.6.4 主权对象的完整性不依赖存储授权
+#### 3.8.4 主权对象的完整性不依赖存储授权
 
-无论采用哪种存储与授权机制，以下两个对象——`net/descriptor.json`、`net/trackers.json`——的完整性由**创建者签名**保证（2.1 与 4.3 节），而不是由存储 ACL 保证：攻击者即便持有整桶写权限，没有创建者私钥也伪造不出合法签名，读取方验签即拒绝。
+无论采用哪种存储与授权机制，以下两个对象——`descriptor.json`、`trackers/manifest.json`——的完整性由**创建者签名**保证（2.1 与 4.3 节），而不是由存储 ACL 保证：攻击者即便持有整桶写权限，没有创建者私钥也伪造不出合法签名，读取方验签即拒绝。
 
 因此存储侧的最小权限是**纵深防御的第二层**，不是唯一防线。由此产生两条**必须**满足的协议要求：
 
 1. **验签是强制项**。所有读取这两个对象的组件（客户端、Tracker、管理面配置生成器）**必须**校验创建者签名，**不得**因为"存储侧已经做了 ACL"而省略。
 2. **防回滚**。签名无法阻止"把对象换成旧的合法版本"（例如恢复一个已被移除的 Tracker 公钥）。因此这两个对象**必须**携带单调递增的 `seq`，读取方记住见过的最大值，`seq` 回退即拒绝。
 
-此外，**删除**是签名防不住的攻击面（删掉 `net/trackers.json` 即可让网络瘫痪）。它只能靠存储能力缓解：S3 用版本控制 + MFA delete，R2 用 Bucket Locks。这是 3.6.3 节之外、需要在部署清单里单独列出的一项。
+此外，**删除**是签名防不住的攻击面（删掉 `trackers/manifest.json` 即可让网络瘫痪）。它只能靠存储能力缓解：S3 用版本控制 + MFA delete，R2 用 Bucket Locks。这是 3.8.3 节之外、需要在部署清单里单独列出的一项。
 
 ## 4. 身份与密钥
 
@@ -312,21 +458,21 @@ Deny 优先，因此在 S3 上"Tracker 改不了谁有权签发"是**云厂商�
 
 ### 4.2 网络内身份与吊销范围
 
-一个 peer 要在某个网络活动，需在该网络的桶里有注册记录（`net/peers/<peer_id>.json`）。因此：
+一个 peer 要在某个网络活动，需在该网络的桶里有注册记录（`peers/<peer_id>/info.json`）。因此：
 
 - **加入新网络 = 在该网络 register 一次**（密钥对不变，`peer_id` 不变）。
-- **吊销是网络级的**：`net/revocations/*` 属于某个网络，A 网络吊销一个 peer 不影响他在 B 网络。这是 self-hosted 模型的自然结果——创建者只能管自己的网络。
+- **吊销是网络级的**：`revocations/*` 属于某个网络，A 网络吊销一个 peer 不影响他在 B 网络。这是 self-hosted 模型的自然结果——创建者只能管自己的网络。
 - 全局吊销（"这把密钥在所有网络都失效"）本文**不定义**；跨网络的信誉与封禁属于上层能力，可用共享黑名单服务实现，但不进协议。
 
 ### 4.3 签发密钥与 `kid`
 
-`net/trackers.json` 是该网络的 JWKS，由创建者签名：
+`trackers/manifest.json` 是该网络的 JWKS，由创建者签名：
 
 ```text
 {
   v: 1
   network_id: "s3://my-bucket"
-  seq: <u64>                          单调递增，防回滚（见 3.6.4 节）
+  seq: <u64>                          单调递增，防回滚（见 3.8.4 节）
   keys: [ { kid: "t1-2026-09", alg: "EdDSA", public_key: <32B>, created_at, status: "active" },
           { kid: "t1-2026-06", alg: "EdDSA", public_key: <32B>, status: "retired" } ]
   signature: <64B>    sign(creator_public_key, canonical(本文件除 signature 外))
@@ -371,22 +517,23 @@ challenge = JWT { iss: network_id, kid, sub: peer_id,
 
 | 原持久状态 | 新归属 |
 | --- | --- |
-| 身份注册表 | 桶 `net/peers/*` |
-| `revoked_keys` | 桶 `net/revocations/*` |
-| 资源索引 | 桶 `net/resources/*` |
+| 身份注册表 | 桶 `peers/*` |
+| `revoked_keys` | 桶 `revocations/*` |
+| 资源声明关系 | 桶 `announcements/<resource_id>/<peer_id>.json` |
+| 资源实体与内容 | 桶 `resources/<resource_id>/{info,data,hashes}` |
 | connection 记录 | 已无状态化（既有 #8） |
 | login nonce | 无状态化（4.4 节） |
 | `jti` 一次性消费 | Punch 内存（`aud` 已绑定单实例） |
 | Punch / TURN 拓扑与健康 | 基础设施管理面；Tracker 仅持本地探测缓存（7.5 节） |
 
-Tracker 剩下三样东西：**签名密钥**（KMS）、**限流计数**（本地、可丢失）、**索引缓存**（本地、可重建）以及 **Punch 探测缓存**（本地、可重建）。前两项不是"持久业务状态"，第三项丢了能重建，因此 Tracker 可以做纯粹的弹性计算。
+Tracker 剩下四样东西：**签名密钥**（KMS）、**限流计数**（本地、可丢失）、**资源图缓存**（本地、可重建，见 3.6 节）以及 **Punch 探测缓存**（本地、可重建）。前两项不是"持久业务状态"，后两项丢了都能从桶重建，因此 Tracker 可以做纯粹的弹性计算。
 
 **Tracker runtime 与基础设施管理面分开。** 托管多个网络的 Tracker 需要知道"服务哪些网络、桶在哪、用哪把 key、可用哪些 Punch / TURN"，但它只消费一份可缓存、可重建的**运行配置快照**。两种形态：
 
 - **自托管单网络**：维护者提供本地配置（`network_id`、桶位置、key 路径、候选 Punch / TURN）；
 - **PaaS 多租户**：运营方控制面维护租户、Punch fleet、TURN fleet、配额与 KMS 引用，可按自身需要使用数据库、服务发现或其他存储；它把编译后的运行配置下发给同一套 Tracker / Punch 二进制。
 
-因此"Tracker 完全无状态"的准确表述是：**Tracker runtime 不持有任何网络的持久业务状态**；网络的身份、索引、吊销仍在创建者桶里，Binding 与 `jti` 仍在 Punch 内存里。PaaS 控制面是否持有运维数据库是协议外实现选择，不影响 self-hosted 与 PaaS 的运行时同构。
+因此"Tracker 完全无状态"的准确表述是：**Tracker runtime 不持有任何网络的持久业务状态**；网络的身份、announcement 边、吊销仍在创建者桶里，Binding 与 `jti` 仍在 Punch 内存里。PaaS 控制面是否持有运维数据库是协议外实现选择，不影响 self-hosted 与 PaaS 的运行时同构。
 
 ### 5.2 Tracker REST API
 
@@ -405,6 +552,12 @@ Tracker 剩下三样东西：**签名密钥**（KMS）、**限流计数**（本�
 所有票据的 `iss` 为 `network_id`。Tracker **必须**拒绝为不属于本网络（`iss` 不匹配）的票据提供服务。
 
 `POST /connections/relay` 与既有设计的无状态授权一致：Tracker 不保存 connection 记录，直接验 connect JWT 本体（签名 + `sub`/`target` + `info_hash` + `now <= grace_until`，**不验** `exp`）。常量关系沿用 `ICE_TIMEOUT(20s) < CONNECT_JWT_EXP(60s) < RELAY_GRACE(900s)`。
+
+`PUT /peers/{peer_id}/resources` 与 `GET /resources/{info_hash}/peers` 的持久化语义见 3.4.1 与 3.6 节：
+
+- **announce**：`add` / `del` 逐 `resource_id` 独立生效，不提供跨资源事务；批量请求可按资源分组 fan-out。每个 `(peer_id, resource_id)` 边先条件写桶，成功后才更新本实例资源图，最后才向 Peer 返回成功；`generation` 回退的更新**必须**拒绝。
+- **query**：先查本地资源图；目标 `resource_id` 处于 Unknown 时，**必须**通过 singleflight 回源桶的 `announcements/<resource_id>/` 完成 hydrate，再过滤 `state == present` 且 `expires_at > now` 后返回候选。**不得**因为资源图未加载而返回空结果。
+- 所有桶访问都经由 3.2 节的 `MetadataStore` / `BlobStore` 抽象，Tracker 业务逻辑不得直接拼 S3 object key。
 
 #### Tracker runtime 配置边界
 
@@ -489,13 +642,13 @@ Punch 不维护网络级 issuer、撤销或配额表，也不消费 `trust_bundl
 
 Punch 对 capability 只做通用检查：签名来自本集群 authority、`aud == punch_id`、`scope` / `nbf` / `exp` 有效、`jti` 未消费、以及本机全局 admission 未满。`iss=network_id` 可以作为不透明 namespace key 隔离 Binding 和连接记录，但 Punch 不用它查找任何网络配置。
 
-这同时解决 PaaS Punch 的未授权使用：PaaS Punch 只信任 PaaS 控制集群的 `K_paas`；任意外部 Tracker 即使被网络创建者写入 `net/trackers.json`，也没有 `K_paas.private`，签不出该 Punch 接受的 capability。PaaS 在为一个网络提供 Tracker 服务前，必须验证该网络桶已将 `K_paas.public` 授权进 `net/trackers.json`；套餐、区域与网络配额由 PaaS Tracker 的**签发逻辑**控制，而非下发给 Punch 的逐网络策略。
+这同时解决 PaaS Punch 的未授权使用：PaaS Punch 只信任 PaaS 控制集群的 `K_paas`；任意外部 Tracker 即使被网络创建者写入 `trackers/manifest.json`，也没有 `K_paas.private`，签不出该 Punch 接受的 capability。PaaS 在为一个网络提供 Tracker 服务前，必须验证该网络桶已将 `K_paas.public` 授权进 `trackers/manifest.json`；套餐、区域与网络配额由 PaaS Tracker 的**签发逻辑**控制，而非下发给 Punch 的逐网络策略。
 
 自建完全同构：维护者配置 `K_self.private` 给自己的 Tracker、`K_self.public` 给自己的 Punch。自建 Tracker 不能直接使用 PaaS Punch，反之亦然；要迁移则迁移整个控制集群，网络桶、`network_id`、peer 身份和种子文件不变。
 
 #### 有界撤销
 
-网络级撤销记录仍以创建者桶的 `net/revocations/*` 为权威来源，Tracker 负责读写和拒绝后续请求。Punch 不读取它，撤销收敛由短票据保证：
+网络级撤销记录仍以创建者桶的 `revocations/*` 为权威来源，Tracker 负责读写和拒绝后续请求。Punch 不读取它，撤销收敛由短票据保证：
 
 - `connect` ticket 最长 60 s，Tracker 停签后，新的信令连接最多在 60 s 内收敛；
 - `punch` ticket 最长 5 分钟，Binding 的 `authorized_until` **不得**超过该 ticket 的 `exp`；heartbeat 只能维持 NAT 映射，**不得**把 Binding 延长超过 `authorized_until`；
@@ -519,7 +672,7 @@ revoke 之后，被吊销者的残留能力（沿用既有 #19 的分析，并�
 
 本文带来的两点自然变化：
 
-1. **`proof_list` 的默认形态就是桶里的 `files/<hh>/<info_hash>.hashes`**——冷启动所需的"数据 + 证明"成对可得，在创建者把文件放进桶时就自动满足了。
+1. **`proof_list` 的默认形态就是桶里的 `resources/<resource_id>/hashes`**——冷启动所需的"数据 + 证明"成对可得，在创建者把文件放进桶时就自动满足了。
 2. **`cdn_list` 默认指向桶**。创建者**可以**在桶前挂 CDN 做加速，但那会引入一个"桶出向流量"之外的计量口径，计费上**应当**以桶账单为准（见 8.1 节）。
 
 客户端仍按既有规则校验：`leaf_hashes` 长度必须为 `n × 32`、本地重建 root 必须等于 `info.root`，不符则拒绝；`proof_list` 缺失或重建不符时，CDN（桶）数据**不得**进入 verified 状态。
@@ -542,7 +695,7 @@ revoke 之后，被吊销者的残留能力（沿用既有 #19 的分析，并�
 
 ### 7.2 L2：多运营方联邦
 
-因为授权公钥集合在桶里（`net/trackers.json`），网络可以配置多个同一控制集群的 Tracker 实例做负载均衡与容灾：它们共享 admission authority，客户端按 `kid` 验签，任一实例都能返回同一个 Punch pool 的 capability。
+因为授权公钥集合在桶里（`trackers/manifest.json`），网络可以配置多个同一控制集群的 Tracker 实例做负载均衡与容灾：它们共享 admission authority，客户端按 `kid` 验签，任一实例都能返回同一个 Punch pool 的 capability。
 
 不同运营方的 Tracker 也可以被创建者写入网络 JWKS，但在 v1 中它们是**独立控制集群**：各自只能为自己的 Punch pool 签 capability，不能直接复用对方 Punch。跨控制集群的 Peer discovery / capability delegation 留作后续联邦协议，不在本文定义。
 
@@ -557,7 +710,7 @@ TURN 是唯一不落在创建者桶上的基础设施成本，也是唯一真正
 | 方案 | 说明 |
 | --- | --- |
 | PaaS 全球池（默认） | 运营方提供，按 relay 出向 GB 计费（见 9.2 / 9.3 节），创建者无需运维 |
-| 创建者自带 | 写进 `net/descriptor.json` 的 `turn_servers`，成本自担 |
+| 创建者自带 | 写进 `descriptor.json` 的 `turn_servers`，成本自担 |
 | 混合 | 默认 PaaS 池，允许按区域覆盖 |
 
 既有 #11 记录的两个问题（coturn 原生不支持 per-connection 对端约束、relay 占比影响成本）在此不变，仍待实测——只是它们的性质变了：relay 成本不再是"侵蚀利润的隐性支出"，而是一项**可计价的服务**（9.3 节）。
@@ -668,7 +821,7 @@ P2P 控制服务的最小可迁移单元是 **Tracker + Punch 控制集群**，�
 | 单元 | 协议支持 | 可选项 |
 | --- | --- | --- |
 | 控制集群（Tracker + Punch） | 共享 admission authority；Tracker 主动 `punch.healthz` 探测集群 Punch | PaaS 托管 / 创建者自建 / 第三方；切换时迁移整个集群 |
-| TURN | `net/descriptor.json` 的 `turn_servers` | PaaS 全球池（默认）/ 创建者自带 / 混合 |
+| TURN | `descriptor.json` 的 `turn_servers` | PaaS 全球池（默认）/ 创建者自带 / 混合 |
 | 桶 | `network_id` 即桶 URI | 永远是创建者自己的 |
 
 因此计费以控制集群与 TURN 为单位；只用 TURN 就只付 TURN。7.4 节列出的三种 TURN 归属在此收敛为"PaaS 提供是默认值，自建是可选覆盖"。
@@ -722,7 +875,7 @@ P2P 控制服务的最小可迁移单元是 **Tracker + Punch 控制集群**，�
 
 桶产生的请求费、存储费与出向流量费都记在**创建者自己的云账号**上，不经我们手，因此**没有存储加价**——这是本模型相对传统托管的一个卖点。
 
-但它带来一条责任：**我们的实现参数直接决定客户的云账单**。announce TTL 越短、LIST 越频繁、缓存命中率越低，他的请求费越高。因此第 3.4 节的参数（TTL ≥ 3 小时、LIST 结果缓存 30–60 s）不只是性能优化，而是**对客户钱包的承诺**；**应当**提供一个成本估算器，让客户在创建网络时就能看到预期的桶费用。
+但它带来一条责任：**我们的实现参数直接决定客户的云账单**。announce TTL 越短、LIST 越频繁、缓存命中率越低，他的请求费越高。因此第 3.5 节的参数（TTL ≥ 3 小时、LIST 结果缓存 30–60 s）不只是性能优化，而是**对客户钱包的承诺**；**应当**提供一个成本估算器，让客户在创建网络时就能看到预期的桶费用。
 
 ### 9.7 护城河在哪
 
@@ -748,7 +901,7 @@ P2P 控制服务的最小可迁移单元是 **Tracker + Punch 控制集群**，�
 | 批量注册撑爆注册表 | 存储膨胀 | 沿用既有 #16 的建议：PoW / 邀请码 / 限流 |
 | 桶凭据泄露 | 元数据被改写 | 凭据只发给服务端组件，按前缀最小授权，定期轮换 |
 
-数据面的完整性仍然**不依赖任何服务端**：端到端 DTLS + Merkle 校验，锚点是 `info_hash` 自校验的 `info.root`。
+数据面的完整性仍然**不依赖任何服务端**：端到端 DTLS + Merkle 校验，锚点是 `resource_id` 自校验的 `info.root`。
 
 ## 11. v2 → v3 差异清单
 
@@ -757,7 +910,7 @@ P2P 控制服务的最小可迁移单元是 **Tracker + Punch 控制集群**，�
 | 1 | 权威状态从 Tracker 存储迁到创建者的桶 | 架构 |
 | 2 | 信任根从 Tracker 改为网络创建者 | 语义 |
 | 3 | 引入 `network_id`，JWT 的 `iss` 改为 `network_id` | 协议 |
-| 4 | 引入 `net/trackers.json`（JWKS），`kid` 承载签发者身份 | 协议 |
+| 4 | 引入 `trackers/manifest.json`（JWKS），`kid` 承载签发者身份 | 协议 |
 | 5 | 吊销范围从全局改为网络级 | 语义 |
 | 6 | login nonce 改为自包含挑战，Tracker 零持久状态 | 协议 |
 | 7 | Punch 不读桶、不注册网络、不向 Tracker 拉业务状态；只信任控制集群 admission authority | 架构 |
@@ -768,7 +921,10 @@ P2P 控制服务的最小可迁移单元是 **Tracker + Punch 控制集群**，�
 | 12 | 计量基准改为桶出向流量 + A/B 对照，遥测降级为归因 | 产品 |
 | 13 | 数据面（Merkle / chunk / 调度 / TURN 回退） | **不变** |
 | 14 | 服务形态：开源实现 + 托管 PaaS，组件可混合自建、按组件计费（第 9 章） | 产品 |
-| 15 | 主权对象（`descriptor` / `trackers`）带创建者签名与单调递增 `seq`；完整性由密码学保证，不依赖存储 ACL（3.6.4 节） | 协议 |
+| 15 | 主权对象（`descriptor` / `trackers`）带创建者签名与单调递增 `seq`；完整性由密码学保证，不依赖存储 ACL（3.8.4 节） | 协议 |
+| 16 | 桶对象布局改为实体 / 关系分离：`resources/<id>/{info,data,hashes}`、`peers/<id>/info.json`、`announcements/<rid>/<pid>.json` | 架构 |
+| 17 | announcement 边从裸声明改为带 `state` / `generation` 的状态对象；`del` 用 tombstone 代替物理删除 | 协议 |
+| 18 | 存储抽象为 `MetadataStore` + `BlobStore` 逻辑键空间；S3 是默认后端，KV / SlateDB 等可作派生或替代实现 | 架构 |
 
 ## 12. 未决问题
 
