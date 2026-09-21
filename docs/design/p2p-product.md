@@ -27,7 +27,7 @@
 | 组件 | 职责 | 为什么不能复用 |
 | --- | --- | --- |
 | **Tracker Server** | 控制面核心：身份注册表、资源索引（announce / query）、JWT 签发、nonce 一次性语义、revocation（§7.2.1）；connection 授权已无状态化，不存连接记录 | 协议完全自定义（Ed25519 身份 + JWT 授权 + info_hash 索引），BT tracker 不适用 |
-| **Punch Server** | 信令中继：Binding 维护（join / heartbeat / exit）、常驻与瞬时信道、signal_key 断线恢复、connect JWT 的 jti 消费、容量控制（§7.2.2） | 自定义信令中继，比 STUN/TURN 复杂，无现成组件 |
+| **Punch Server** | 信令中继：Binding 维护（join / heartbeat / exit）、常驻与瞬时信道、signal_key 断线恢复、connect JWT 的 jti 消费、容量控制（§7.2.2）；对 Tracker 只有一条单向依赖（查询吊销状态，可缓存） | 自定义信令中继，比 STUN/TURN 复杂，无现成组件 |
 | **Client SDK** | 身份管理 + 控制面通信 + WebRTC 数据面拼装（§7.3 三张函数面表格的完整实现） | 最大的工程量，见第 3 节 |
 
 ### 2.2 可复用组件
