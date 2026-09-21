@@ -4,7 +4,7 @@
 | --- | --- |
 | 设计稿（Experimental） | 2026-09-20 |
 
-> 变更摘要：2026-09-20 起数据面改为 Merkle 证明校验（`info` 的 `hashes` 列表 → `root`，`v: 1` → `v: 2`），新增 `request_proof` / `proof` / `pause` / `resume` 消息与叶子哈希列表的两种来源（envelope 内联 `leaf_hashes`、`proof_list` URL）。证明走可靠控制通道、先于数据到达，载荷默认含叶子哈希以便缓存复用（对齐 BEP 52 的 `base layer = 0`）。
+> 变更摘要：2026-09-20 起数据面改为 Merkle 证明校验（`info` 的 `hashes` 列表 → `root`，`v: 1` → `v: 2`），新增 `request_proof` / `proof` / `pause` / `resume` 消息与叶子哈希列表的两种来源（envelope 内联 `leaf_hashes`、`proof_list` URL）。证明走可靠控制通道、先于数据到达，载荷默认含叶子哈希以便缓存复用（对齐 BEP 52 的 `base layer = 0`）。2026-09-21 收敛 Tracker 与 Punch Server 的耦合面：两者之间只保留 Punch → Tracker 的吊销查询这一条单向依赖，revoke 通知降级为尽力而为。
 
 ## 1. 引言
 
@@ -195,12 +195,13 @@ revocation_token = sign(client_private_key, "revoke" || peer_id || timestamp)
 revoke(peer_id, revocation_token)
 ```
 
-Tracker 用 peer_id 对应的 public_key 验签 token（验证"这确实是私钥持有者授权的吊销"），验签通过后**必须**原子地执行以下四项：
+Tracker 用 peer_id 对应的 public_key 验签 token（验证"这确实是私钥持有者授权的吊销"），验签通过后**必须**原子地执行以下三项：
 
 1. 将 `SHA-256(public_key)` 写入 **`revoked_keys`** —— **永久记录，不设 TTL**；
 2. 删除该 `peer_id` 的注册记录，使其无法再 `login`；
-3. 记录 `revoked_at` 时间戳，作为所有已签发票据的失效判据；
-4. 通知各 Punch Server 清除该 `peer_id` 的 Binding（Punch 侧也可等 Binding 自然过期，但**应当**主动清理）。
+3. 记录 `revoked_at` 时间戳，作为所有已签发票据的失效判据。
+
+第四项——通知各 Punch Server 清除该 `peer_id` 的 Binding——是**尽力而为**的（MAY），**不得**作为吊销生效的前提（理由见下文"残留窗口"）。
 
 **吊销是终止状态，不因任何 TTL 而解除。** 由于 `peer_id = base32(SHA-256(public_key)) + 校验位`，吊销 `peer_id` 等价于吊销这把公钥——不存在"换一把私钥继续用同一个 `peer_id`"的可能。因此给吊销记录设置 TTL 等同于给攻击者留一条等待绕过的路径：TTL 到期后，持有泄露私钥者直接 `login` 即可恢复身份，连重新注册都不必。以 `SHA-256(public_key)` 而非 `peer_id` 字符串作主键，是为了杜绝"同一把密钥换个编码再来一次"。
 
@@ -210,7 +211,15 @@ Tracker 用 peer_id 对应的 public_key 验签 token（验证"这确实是私�
 if revoked_at exists and token.iat <= revoked_at: 拒绝
 ```
 
-`iat` 是 JWT 标准 claim，无需新增字段。这一条判据同时覆盖 `login`、`punch.join` 与 `connect`，因此吊销**立即生效**——不必维护"已吊销但仍在途"的 session 黑名单，也不必等 session 自然过期。Punch Server 在 `join` 时**应当**通过 Tracker 的公开 API 校验 `peer_id` 是否被吊销（可短时间缓存以降低延迟；缓存时长即吊销生效的延迟上界，**应当**控制在分钟级）。
+`iat` 是 JWT 标准 claim，无需新增字段。这一条判据同时覆盖 `login`、`punch.join` 与 `connect`，因此吊销**立即生效**——不必维护"已吊销但仍在途"的 session 黑名单，也不必等 session 自然过期。
+
+**Punch 如何取得吊销状态**：Punch Server 在 `join` 与 `signal(offer)` 时**应当**通过 Tracker 的公开 API 校验 `peer_id` 是否被吊销，可短时间缓存以降低延迟（缓存时长即吊销生效的延迟上界，**应当**控制在分钟级）。缓存未命中且 Tracker 不可达时，Punch **必须**拒绝该请求（fail-closed）：此时放行会让吊销在 Tracker 故障期间完全失效，而拒绝只是让重连的 Peer 稍后重试——二者之间，可用性让位于安全性。
+
+**残留窗口**：吊销不需要任何跨服务推送通道即可收敛。被吊销者无法再 `login`，于是连锁失效——拿不到 punch JWT（Binding 无法重建或续期）、拿不到 session JWT（无法 `announce` 续期索引、无法 `query` 发现 Peer）。残留能力只剩两项：已存在的 Binding 在其 TTL（10–30 分钟）内仍可被找到，以及已建立的 DataChannel 继续传输。前者还受一层限制——其他 Peer 要经由 `query` 才能找到他，而他的资源索引无法续期，TTL 一到便不再被返回。
+
+要把窗口压得更小，最划算的手段不是引入下行通道，而是**在 `signal(offer)` 路径上也校验吊销**：Punch B 验 connect JWT 时按本节判据校验 `iat > revoked_at`（见 7.2.2 节），而被吊销者拿不到新的 connect JWT。这样即便 Binding 残留，他也无法接受任何新连接。
+
+由此得到一条部署约束：实现**可以**在 revoke 时尽力通知 Punch 清理 Binding，但**不得**把"通知成功"当作吊销生效的前提，也**不得**为此要求 Punch Server 具备被 Tracker 反向连接的入站可达性（见 7.1 节）。
 
 **为什么 token 由客户端生成而非 Tracker**：吊销权归用户所有——即使 Tracker 被攻破，攻击者拿到数据库也无法伪造吊销（没有私钥签不出 token），只能阻止合法用户提交吊销（DoS，但无法冒充身份）。代价是客户端**必须**在 `register` 时就离线保存好 token，而现实是不会有用户主动备份一个字符串：**token 丢失即永久丧失吊销能力**。因此实现**可以**额外提供一条由 Tracker 签发的长期 revoke credential 作为备份路径——它证明的是"吊销授权"而非"私钥持有"，与客户端自签的 token 并行、任一可用。两者并存时的取舍是：Tracker 签发提高了可用性，但也让 Tracker 具备单方吊销的能力。
 
@@ -508,6 +517,14 @@ Tracker API 基于 HTTPS REST：每个请求独立无状态，session JWT 通过
 
 Tracker **可以**部署为无状态多实例：实例间共享唯一签名密钥（支持 `kid` 轮换）与一致状态存储（身份注册表、`revoked_keys`（永久）、资源索引，以及 login nonce 的一次性消费语义）。注意 nonce 与 `jti` 的已消费记录**不得**只存于实例内存——多实例下 challenge 与 login 落在不同的实例会直接失败。connection 授权已完全无状态化，不进入共享存储（见 3.4 节）。对客户端与 Punch Server 的契约只暴露 Tracker 的**逻辑服务地址**（如负载均衡前的域名），**不得**暴露具体实例——横向扩展是内部实现细节，不影响任何协议契约。Punch Server 清单由 Tracker 维护，来源为部署配置或 Punch Server 向 Tracker 注册（注册携带 `punch_id`、自身公钥、地址、region 与容量，注册对象为 Tracker 的逻辑服务地址而非具体实例，注册协议为内部运维契约、不在本规范的客户端接口范围内）；Tracker 从清单中为 login 分配 Punch Server，并在 query 时实时回填目标 Peer 所在 Punch Server 的地址与公钥。Punch Server 公钥是客户端验证 Punch 服务器身份的锚点（见 3.5 节），与地址解耦——地址会随部署变化，公钥是长期身份。
 
+**Tracker 与 Punch Server 的耦合面**：两个服务之间**只有一条运行时依赖**——Punch 在处理 `punch.join` / `signal(offer)` 时向 Tracker 查询吊销状态（只读、可缓存、单向）。方向性是刻意的：Tracker 暴露逻辑服务地址，Punch 是它的客户端；反过来要求 Punch 具备被 Tracker 连接的入站可达性，会把整个 Punch 集群的部署前提（公网地址、防火墙策略）绑死在一条极低频的通知上。因此：
+
+- **不得**要求两者之间维护常驻信道或长连接——注册、吊销查询、容量上报都是低频事件，普通 HTTPS 请求即可；
+- Punch 注册（`punch_id`、公钥、地址、region、容量）**可以**走"向 Tracker 注册"，也**可以**完全由部署配置下发，两种方式都属内部运维契约；
+- revoke 时"通知 Punch 清除 Binding"是**尽力而为**（MAY），失败不影响正确性（残留窗口分析见 3.1.4 节）。
+
+**两者的存储扩展模型是相反的**：Tracker 多实例**必须**共享状态存储（身份注册表、`revoked_keys`、资源索引与 nonce 一次性消费语义）；Punch 侧的状态（Binding、已消费 `jti`、连接记录）**不必**跨实例共享——两种 JWT 的 `aud` 都绑定到单个 Punch Server（`punch_id` / `punch_b_id`），每张票只可能被那一台消费。只有当同一个 `punch_id` 需要多实例容灾时，才需要为 Binding 引入共享存储或粘性路由。
+
 `punch.join` / `punch.exit` / `punch.signal` 的请求响应控制面经加密认证信道传输（TCP+TLS、UDP+DTLS 或 QUIC 均可，客户端与 Punch Server 间的常驻与瞬时信令信道同此要求）；为维持 NAT 映射的 `punch.heartbeat` 可以使用 UDP，但**必须**遵循前述 MAC、时钟窗口和序列号校验。消息使用版本化 schema；未知必填字段、超出大小限制的 candidate 列表和不匹配的 `connection_id` 都**必须**拒绝。每个响应至少带协议版本、请求 ID 和明确的错误码。所有时钟校验（`nbf`/`exp`、heartbeat 的时间戳窗口）使用统一的服务端可配置容差（如 ±60 秒），客户端**应当**与可信时间源对时，容差需计入 Tracker 的 nonce 去重窗口、Punch/Tracker 的 `jti` 去重窗口与序列号乱序窗口的计算。
 
 ### 7.2 接口契约表
@@ -571,7 +588,7 @@ register 不需要 nonce，因为这是客户端**第一次**联系 Tracker，Tr
 | --- | --- |
 | `204 No Content` | 吊销成功 |
 
-**授权与限制**：验证 token 签名；将 `SHA-256(public_key)` 写入 `revoked_keys`（**永久，无 TTL**），删除注册记录，记录 `revoked_at`，并通知 Punch Server 清除 Binding。此后一切 `iat <= revoked_at` 的票据**必须**拒绝（见 3.1.4 节）。被吊销 `peer_id` **永久不得**再次注册。
+**授权与限制**：验证 token 签名；将 `SHA-256(public_key)` 写入 `revoked_keys`（**永久，无 TTL**），删除注册记录，记录 `revoked_at`。实现**可以**尽力通知 Punch Server 清除该 peer 的 Binding，但该通知失败**不得**影响吊销生效（见 3.1.4 节）。此后一切 `iat <= revoked_at` 的票据**必须**拒绝（见 3.1.4 节）。被吊销 `peer_id` **永久不得**再次注册。
 
 **交互流程**：
 
@@ -585,7 +602,7 @@ sequenceDiagram
     Note over T: 取 public_key 验签 token
     Note over T: 写入 revoked_keys (永久, 无 TTL)
     Note over T: 删除注册记录, 记录 revoked_at
-    Note over T: 通知 Punch 清除 Binding
+    Note over T: [可选] 尽力通知 Punch 清除 Binding<br/>(失败不影响吊销生效)
     Note over T: 此后 iat <= revoked_at 的票据全部拒绝
     T-->>C: 204 No Content
     Note over C,T: 攻击者即使持有旧私钥, 后续 login/join 被拒绝
@@ -815,7 +832,7 @@ Punch Server 上的接口走加密认证信道（非 REST），以 RPC 风格的
 | `binding_key` | string | 会话级对称密钥（HMAC 用） |
 | `expires_at` | int64 | Binding 过期时间 |
 
-**授权与限制**：JWT + 持钥证明；punch JWT 的 `jti` 一次性消费（Punch Server 维护已消费 `jti` 记录，覆盖 punch JWT `exp` 两倍时长）；`peer_id` 未被吊销（`iat > revoked_at`）；新 binding 替换旧 binding。客户端重连或 binding 过期时需重新 `login` 获取新 punch JWT。
+**授权与限制**：JWT + 持钥证明；punch JWT 的 `jti` 一次性消费（Punch Server 维护已消费 `jti` 记录，覆盖 punch JWT `exp` 两倍时长）；`peer_id` 未被吊销（`iat > revoked_at`），该状态来自 Tracker 的查询或本地缓存，**查询失败时不得放行**（fail-closed，见 3.1.4 节）；新 binding 替换旧 binding。客户端重连或 binding 过期时需重新 `login` 获取新 punch JWT。
 
 **交互流程**：
 
@@ -832,7 +849,7 @@ sequenceDiagram
     B->>PB: punch.join(punch_jwt, public_key, signature, ts)
     Note over PB: 验 punch JWT (签名, aud, scope, exp)<br/>JWT 的 sub == peer_id?
     Note over PB: 查 jti 未被消费过
-    Note over PB: 查 peer_id 未被吊销 (查 Tracker 或缓存)
+    Note over PB: 查 peer_id 未被吊销 (查 Tracker 或缓存)<br/>查不到且 Tracker 不可达 → 拒绝 (fail-closed)
     Note over PB: 校验 SHA-256(public_key) == JWT.sub (公钥与身份一致)
     Note over PB: 用 public_key 验签 signature
     Note over PB: 标记 jti 已消费 (一次性)
@@ -949,7 +966,7 @@ sequenceDiagram
 | `ok` | bool | 转发确认 |
 | `error` | string? | 错误码（如 `peer_offline`、`rate_limited`、`invalid_jwt`） |
 
-**授权与限制**：offer 验证 connect JWT（`aud`、`scope`、`sub`、`target_peer_id`、`info_hash`、`connection_id`、`exp`）；answer/candidate/cancel 仅接受已登记连接的双方；SDP 对 Punch Server 不透明；A 断线重连凭 `connection_id` + `signal_key` 恢复。
+**授权与限制**：offer 验证 connect JWT（`aud`、`scope`、`sub`、`target_peer_id`、`info_hash`、`connection_id`、`exp`，以及 `iat > revoked_at`——这一项使残留 Binding 也无法接受新连接，见 3.1.4 节；吊销状态来自 Tracker 查询或本地缓存，查询失败时**不得**放行）；answer/candidate/cancel 仅接受已登记连接的双方；SDP 对 Punch Server 不透明；A 断线重连凭 `connection_id` + `signal_key` 恢复。
 
 **交互流程（offer — A 发起连接）**：
 
