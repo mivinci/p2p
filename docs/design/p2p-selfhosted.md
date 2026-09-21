@@ -4,7 +4,7 @@
 | --- | --- |
 | 提案（RFC，未定案） | 2026-09-21 |
 
-> **本文的定位**：本文是 `p2p-technical.md`（下称"既有设计"）的一次**定位级改版提案**，不是补丁。第 9 章另外给出服务形态与计费边界（开源实现 + 托管 PaaS，我们不托管网络的数据）。既有设计隐含"由单一运营方提供一张全局 P2P 网络"的假设——Tracker 是信任根、状态存在 Tracker 自己手里、运营方承担带宽与中继成本。本文把假设换成：**任何人都可以创建一个 P2P 网络，网络的权威状态存放在创建者自己的对象存储（桶）里**。
+> **本文的定位**：本文是 `p2p-technical.md`（下称"既有设计"）的一次**定位级改版提案**，不是补丁。第 9 章另外给出服务形态与计费边界（开源实现 + 托管 PaaS，我们不托管网络的数据）。2026-09-21 补入桶凭据的授予与撤销机制（3.6 节），并据此把安全边界从"路径前缀"改为"桶"（2.1 节）——推荐一网络一桶。既有设计隐含"由单一运营方提供一张全局 P2P 网络"的假设——Tracker 是信任根、状态存在 Tracker 自己手里、运营方承担带宽与中继成本。本文把假设换成：**任何人都可以创建一个 P2P 网络，网络的权威状态存放在创建者自己的对象存储（桶）里**。
 >
 > 数据面（ICE / DTLS / WebRTC DataChannel、block / piece / chunk、Merkle 证明、调度）几乎不变，本文只做摘要并指向既有设计；**变化集中在控制面与信任模型**。第 9 章给出服务形态与计费边界，第 11 章给出 v2 → v3 的完整差异清单，第 12 章列出尚未定案的问题。
 
@@ -68,10 +68,15 @@ graph LR
 一个网络由它的桶唯一确定。**`network_id` 就是规范化后的桶 URI**：
 
 ```
-network_id = "s3://my-bucket/net/demo"
+network_id = "s3://my-bucket"
 ```
 
 这样定义的好处是它自解释、无需额外哈希、客户端拿到就能定位权威状态；代价是**换桶等于换网络**（需要重新分发种子），这是可接受的——换存储位置本来就是重建网络级别的操作。
+
+**安全边界是桶，不是路径前缀。** 桶内的 `net/` 与 `files/` 只是固定的对象布局，不承担隔离职责。原因是并非所有 S3 兼容存储都支持前缀级策略：AWS S3 / MinIO / 腾讯云 COS 可以，但 Cloudflare R2 的 API token 粒度是**桶级**（读 / 写 / 列表），没有前缀条件。因此：
+
+- 推荐形态是**一网络一桶**——桶即权限边界，在任何兼容存储上都能得到一致的隔离强度；
+- 若在同一桶内用不同前缀承载多个网络（`network_id = "s3://my-bucket/net/demo"`），则**必须**在存储侧用策略强制该前缀，否则这些网络之间不存在任何隔离保证。这只应在确认目标存储支持前缀级策略时使用，且**不得**在文档中把它当作默认形态。
 
 桶里必须存在一份网络描述符 `net/descriptor.json`：
 
@@ -102,9 +107,9 @@ network_id = "s3://my-bucket/net/demo"
 | 决定谁能当 Punch | 创建者（`net/punches.json`） |
 | 吊销某个 peer | 创建者（直接改桶）或 Tracker（代写） |
 | 签发票据 | Tracker（用 `net/trackers.json` 里的密钥） |
-| 撤销某个 Tracker | 创建者（从 `net/trackers.json` 移除 + 撤销其桶授权） |
+| 撤销某个 Tracker | 创建者（从 `net/trackers.json` 移除 + 撤销其桶授权，见 3.6 节） |
 
-后果是**Tracker 作恶的破坏半径变小了**：它不能篡改创建者未授权给它写的前缀（见 3.5 节的最小权限），也不能阻止创建者把它踢掉。这是 self-hosted 模型相对单租户模型最实质的安全收益。
+后果是**Tracker 作恶的破坏半径变小了**：它不能篡改创建者未授权给它写的对象（见 3.5 节的权限矩阵与 3.6 节的强制方式），也不能阻止创建者把它踢掉。这是 self-hosted 模型相对单租户模型最实质的安全收益。
 
 ### 2.3 客户端如何加入一个网络
 
@@ -195,13 +200,76 @@ files/<hh>/<info_hash>.hashes                叶子哈希列表（proof_list 目
 
 | 主体 | 权限 | 范围 |
 | --- | --- | --- |
-| 网络创建者 | 读写全部 | 整个前缀 |
+| 网络创建者 | 读写全部 | 整个桶 |
 | Tracker | **读写** | `net/peers/*`、`net/resources/*`、`net/revocations/*`、`net/punches/state/*` |
 | Tracker | **不得** | `net/descriptor.json`、`net/trackers.json`、`net/punches.json` |
 | Punch | **只读** | `net/revocations/*`、`net/punches.json`、`net/punches/state/*` |
 | 客户端 | 只读（公开桶或预签名 URL） | `files/*` |
 
-Tracker 不能改写"谁有权签发"这件事，是 2.2 节"Tracker 作恶破坏半径变小"的技术保证。创建者通过修改桶策略即可随时撤销某个 Tracker——这使多 Tracker 与联邦得以成立（第 7 章）。
+Tracker 不能改写"谁有权签发"这件事，是 2.2 节"Tracker 作恶破坏半径变小"的技术保证。授予与撤销的具体机制见 3.6 节。
+
+### 3.6 凭据的授予与撤销
+
+权限矩阵只是意图，需要存储侧机制把它变成强制约束。本节以 AWS S3 为基准描述，其他兼容存储按同等能力对齐（差异见 3.6.3 节）。
+
+#### 3.6.1 授予：跨账号角色与临时凭据
+
+创建者在自己的云账号里为每个网络建一个角色（如 `p2p-tracker-demo`），信任策略只认运营方，并带 `ExternalId`：
+
+```json
+{
+  "Effect": "Allow",
+  "Principal": { "AWS": "arn:aws:iam::<运营方账号>:role/p2p-tracker-runtime" },
+  "Action": "sts:AssumeRole",
+  "Condition": { "StringEquals": { "sts:ExternalId": "<network_id>" } }
+}
+```
+
+`ExternalId` **必须**设置——它防的是混淆代理（confused deputy）：没有它，运营方可以被诱导去 assume 属于别人的角色。
+
+权限策略用"宽 Allow + 窄 Deny"表达 3.5 节的矩阵：
+
+```json
+[ { "Effect": "Allow",
+    "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+    "Resource": "arn:aws:s3:::<bucket>/net/*" },
+  { "Effect": "Allow",
+    "Action": "s3:ListBucket",
+    "Resource": "arn:aws:s3:::<bucket>",
+    "Condition": { "StringLike": { "s3:prefix": "net/*" } } },
+  { "Effect": "Deny",
+    "Action": ["s3:PutObject", "s3:DeleteObject"],
+    "Resource": ["arn:aws:s3:::<bucket>/net/descriptor.json",
+                 "arn:aws:s3:::<bucket>/net/trackers.json",
+                 "arn:aws:s3:::<bucket>/net/punches.json"] } ]
+```
+
+Deny 优先，因此"Tracker 改不了谁有权签发"是**云厂商强制的**，不是运营方的自律承诺。Punch 的只读凭据同理，只给 `net/revocations/*`、`net/punches.json`、`net/punches/state/*` 的 `GetObject`。
+
+运行时：Tracker 按 `network_id` 调 AssumeRole 换取临时凭据，缓存在内存并自动刷新，**不得**落盘或写进配置文件。一个进程服务多个网络时持有多份凭据，按 `network_id` 索引。
+
+#### 3.6.2 初始化、撤销与审计
+
+**初始化不走这个角色。** `net/descriptor.json`、`net/trackers.json`、`net/punches.json` 是创建者行使主权的三个对象，**应当**由创建者用自己的凭据、通过本地 CLI 生成并上传，运营方压根不持有它们的写权限。运营期凭据只负责 `peers` / `resources` / `revocations` / `punches/state`。
+
+**撤销**即创建者删除角色或修改信任策略。已发出的临时凭据最多还能用到期为止，因此 **session duration 决定了撤销生效的延迟**，建议 15–60 分钟——这是安全性与 AssumeRole 调用频率之间的折中。
+
+**审计**：对象访问的审计日志（CloudTrail 数据面事件或等价能力）让创建者能看到 Tracker 的每一次读写。这既是"创建者可监督"的落地，也是 9.5 节"不留存"承诺的可验证性来源。
+
+**客户端**不参与这套机制：公开网络用桶策略开放 `files/*` 的匿名读；私有网络由 Tracker 用同一角色签发预签名 URL（短期、限定单个对象）。
+
+#### 3.6.3 不同存储的差异
+
+| 存储 | 前缀级策略 | 结论 |
+| --- | --- | --- |
+| AWS S3 | 支持（IAM policy + `s3:prefix`） | 完整实现 3.5 节矩阵 |
+| MinIO | 支持（policy 的 Resource 前缀匹配） | 同上 |
+| 腾讯云 COS | 支持（CAM 的 resource 前缀） | 同上 |
+| Cloudflare R2 | **不支持**（token 粒度为桶级） | 只能做桶级最小权限 ⇒ **必须一网络一桶** |
+
+也就是说：3.5 节的按前缀最小权限**不是通用保证**，它依赖存储能力。采用一网络一桶（2.1 节）可以让所有存储上的隔离强度一致，这也是本文推荐它的主要原因。
+
+> 未决：是否要针对 R2 定义一套"退化但仍可用"的授权形态（例如接受 Tracker 持有整个桶的写权限，改用审计 + 快速撤销来补偿）。见第 12 章未决问题 10。
 
 ## 4. 身份与密钥
 
@@ -548,7 +616,7 @@ SDK 侧按比例分流：**对照组不启用 P2P，实验组启用**。两组�
 | --- | --- | --- |
 | 创建者作恶 | 审查、驱逐、窥视**本网络**元数据 | 这是他的网络，属于设计内权力；跨网络身份不受影响，用户可迁移到别的网络 |
 | 桶被攻破 / 误删 | 该网络元数据不可用 | 版本控制 + 对象锁；客户端需要明确的"网络不可用"降级 |
-| Tracker 被攻破 | 可签发任意票据、可写授权给它的前缀 | 最小权限（3.5 节）：改不了 `trackers.json` / `punches.json`；创建者可随时撤销其桶授权 |
+| Tracker 被攻破 | 可签发任意票据、可写授权给它的对象 | 最小权限（3.5 / 3.6 节）：改不了 `descriptor.json` / `trackers.json` / `punches.json`；创建者删除角色即撤销，延迟 ≤ session duration |
 | Punch 被攻破 | 信令 DoS、 Binding 伪造（无法窃听数据） | 只持只读凭据；`aud` 绑定使票据不可跨 Punch 使用 |
 | 恶意 Peer 投递损坏数据 | 浪费带宽 | Merkle 校验 + 失败计数（沿用既有设计） |
 | 伪造 `leaf_hashes` / `proof_list` | 试图污染数据 | 本地重建 root 与 `info.root` 比对，不符则拒绝 |
@@ -587,6 +655,8 @@ SDK 侧按比例分流：**对照组不启用 P2P，实验组启用**。两组�
 7. **吊销列表的分片阈值**：建议先做全量对象，超过多少条才启用分片需实测。
 8. **产品规划需在新定位下重写**。随单租户模型一起失效的是定价、成本与盈利模型（已由第 8 章计量与第 9 章计费接管）；仍需要的是三块：Client SDK 的平台与语言面、MVP 实施路径、以及**合规责任分配**——自建网络下合规责任主体从运营方转为网络创建者，这一条比原模型更关键，需要单独定义（创建者须知、侵权投诉入口、日志留存边界）。
 9. **是否允许创建者调整影响桶费用的参数**？announce TTL、LIST 缓存时长直接决定他的云账单（9.6 节）。放开调参能帮大客户省钱，但会让成本估算与容量规划变复杂；也可能出现"调长 TTL 导致 query 命中率下降"的互相埋怨。
+10. **不支持前缀级策略的存储（如 R2）如何取舍**？默认答案是要求一网络一桶（2.1 / 3.6.3 节）；若允许多网络共用桶，是否接受"Tracker 持有整桶写权限、改用审计与快速撤销补偿"的退化形态？
+11. **授权引导是产品必做项**。手动创建 IAM 角色与 `ExternalId` 与"每个人都能创建一个网络"直接矛盾。**必须**提供一键引导（生成 `network_id` 与 `ExternalId`、给出 CloudFormation / Terraform 模板或 R2 的 token 创建指引）；本文只提出要求，交互形态属产品范畴。
 
 ## 13. 参考资料
 
