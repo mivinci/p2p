@@ -55,7 +55,7 @@ graph LR
     C -->|授权| T[Tracker]
     C -->|白名单| P[Punch Server]
     T -->|读写元数据| B
-    P -->|只读 吊销列表/清单| B
+    P -->|拉吊销快照| T
     Peer -->|register / login / query| T
     Peer -->|文件字节 / leaf_hashes| B
     Peer <-->|DTLS 直连| Peer
@@ -166,10 +166,10 @@ files/<hh>/<info_hash>.hashes                叶子哈希列表（proof_list 目
 | --- | --- | --- | --- |
 | 文件字节、`*.hashes` | 写一次，读很多 | 桶 | 天然 CDN 缓存 |
 | `descriptor` / `trackers` / `punches` | 极低频写，高频读 | 桶 + CDN | 创建者控制面 |
-| 吊销记录 | 极低频写，高频读 | 桶 + CDN | Punch 拉快照 |
+| 吊销记录 | 极低频写，高频读 | 桶 + Tracker 缓存 | Punch 经 Tracker 拉快照 |
 | 身份注册 | 每 peer 每 90 天写一次，login 时读 | 桶 | 低频 |
 | 资源声明 | 每 peer 每 TTL 写一次 | 桶 | **TTL 必须足够长**，见 3.4 |
-| Punch 运行时状态 | 每 Punch 每 30–60 s 写一次 | 桶（数量极少，可控） | Punch 数量是十到百量级 |
+| Punch 注册状态 | 每 Punch 每 30–60 s 上报 | 桶（由 Tracker 代写，数量极少） | Punch 数量是十到百量级；Punch 自身不碰桶 |
 | Binding / 在线状态 | 每 peer 每 10–30 min 刷新 | **Punch 内存** | 绝不能进桶 |
 | `jti` 一次性消费 | 每次连接 | **Punch 内存** | `aud` 已绑定单实例 |
 | login nonce | 每次 login | **无状态**（见 4.4） | 不做存储 |
@@ -183,7 +183,7 @@ files/<hh>/<info_hash>.hashes                叶子哈希列表（proof_list 目
 2. **覆盖是 last-writer-wins**。因此**资源索引必须拆成"每 peer 一对象"**——若做成单对象并发追加，两个 peer 同时 announce 会互相覆盖。
 3. **条件写可用**：`If-None-Match: *` 可实现"不存在才写"（原子创建），`If-Match: <ETag>` 可实现乐观锁。这两者足以实现吊销记录的幂等写入。
 4. **LIST 分页**：`net/resources/<info_hash>/` 下可能有数万个对象，query **必须**分页（每次 1000 key）并**应当**在 Tracker 侧做短 TTL 缓存。
-5. **无监听机制**（对象存储没有 watch），Punch 侧一律轮询。
+5. **无监听机制**（对象存储没有 watch），Tracker **应当**轮询或按请求刷新桶对象；Punch 不直接访问桶，而是轮询 Tracker 的吊销快照接口（5.5 节）。
 
 ### 3.4 成本与容量约束
 
@@ -191,7 +191,7 @@ files/<hh>/<info_hash>.hashes                叶子哈希列表（proof_list 目
 
 1. **资源声明的 TTL 不得过短**。既有设计的 `ttl: 1800`（30 分钟）在桶模型下会产生显著写放大（1 万 peer 即 33 次写/秒，约 $430/月 的 PUT 费用）。本文建议 TTL **不低于 3 小时**，因为"是否在线"本就由 Punch 的 Binding 决定——**资源索引只表达"声明持有"，不表达"在线"**，失效的候选在 `signal` 阶段会被自然过滤掉。
 2. **Tracker 侧缓存索引 LIST 结果**（30–60 s），把 LIST 放大压到常数级。
-3. **吊销列表与描述符挂 CDN**，读流量不计入桶请求。
+3. **Tracker 缓存吊销列表、描述符与 Punch 清单**，把高频读取压到常数级；Punch 经 Tracker 取吊销快照，不直接读取桶（5.5 节）。
 
 若网络规模大到这些约束不够用，应当引入一层缓存服务（Redis / 内存索引），但那属于优化；本文要求的是**默认配置下不触发**。
 
@@ -204,7 +204,7 @@ files/<hh>/<info_hash>.hashes                叶子哈希列表（proof_list 目
 | 网络创建者 | 读写全部 | 整个桶 |
 | Tracker | **读写** | `net/peers/*`、`net/resources/*`、`net/revocations/*`、`net/punches/state/*` |
 | Tracker | **不得** | `net/descriptor.json`、`net/trackers.json`、`net/punches.json` |
-| Punch | **只读** | `net/revocations/*`、`net/punches.json`、`net/punches/state/*` |
+| Punch | **无桶凭据** | 不直接访问桶；只经 Tracker API 拉取吊销快照 |
 | 客户端 | 只读（公开桶或预签名 URL） | `files/*` |
 
 Tracker 不能改写"谁有权签发"这件事，是 2.2 节"Tracker 作恶破坏半径变小"的技术保证。授予与撤销的具体机制见 3.6 节。
@@ -224,7 +224,7 @@ Tracker **本来就已经持有该网络的签名密钥**（4.3 节的 `kid` 私
 | 主体 | 凭据 | 理由 |
 | --- | --- | --- |
 | Tracker | 桶级读写（一网络一桶） | 它已持有签名密钥，桶级写不扩大权限；一网络一桶保证**跨网络隔离** |
-| Punch | **只读**（或经 CDN 公开读，连凭据都不需要） | 它不持有签名密钥、部署在边缘，是需要严格限制的那个 |
+| Punch | **无桶凭据** | 它不持有签名密钥、部署在边缘，是需要严格限制的那个；吊销状态统一经 Tracker API 获取 |
 
 跨网络隔离才是这里真正要保的东西——一个 Tracker 进程同时服务多个网络，若共用桶则一份凭据可触及所有网络的数据；一网络一桶让这件事天然不成立。
 
@@ -262,7 +262,7 @@ S3 上的具体做法（跨账号角色 + `ExternalId`）如下，其他存储�
 
 Deny 优先，因此在 S3 上"Tracker 改不了谁有权签发"是**云厂商强制的**。但按上面的论证，这条约束属于纵深防御而非必需项：R2 等不支持前缀级授权的存储上可以不做，改由 3.6.4 节的创建者签名承担。
 
-**Punch 的凭据是真正要收紧的**：只给 `net/revocations/*`、`net/punches.json`、`net/punches/state/*` 的 `GetObject`；若这些对象经 CDN 公开分发（5.5 节推荐做法），Punch 甚至可以完全不持有桶凭据。
+**Punch 不得持有任何桶凭据**：它只经 Tracker 的吊销快照接口获取所需状态（5.5 节）。这样一台边缘 Punch 失守不会获得任何网络的对象读取面，也不会因服务多个网络而持有多份桶凭据。
 
 运行时：Tracker 按 `network_id` 调 AssumeRole 换取临时凭据，缓存在内存并自动刷新，**不得**落盘或写进配置文件。一个进程服务多个网络时持有多份凭据，按 `network_id` 索引。
 
@@ -387,7 +387,7 @@ Tracker 剩下三样东西：**签名密钥**（KMS）、**限流计数**（本�
 **运营元数据（租户清单）也不需要数据库。** 托管多个网络的 Tracker 需要知道"服务哪些网络、桶在哪、用哪把 key、配额多少"，但这份运营元数据同样**不是**数据库的合理用途——它读多写少、可全量缓存、变更低频。它的两种形态：
 
 - **自托管单网络**：一个配置文件（`network_id`、桶位置、key 路径、常量），零外部依赖；
-- **PaaS 多租户**：运营方**自己的一个桶**，每网络一个对象（桶位置、key 引用、配额）。Tracker 启动时经 `TENANT_BUCKET_URI` 连上它、拉全量租户清单缓存到本地，之后定期轮询——与 5.5 节 Punch 拉吊销快照是**同一招**。各网络的桶凭据不落明文：以 KMS 信封加密存入，Tracker 只持 KMS 引用，解密结果仅存内存。
+- **PaaS 多租户**：运营方**自己的一个桶**，每网络一个对象（桶位置、key 引用、配额）。Tracker 启动时经 `TENANT_BUCKET_URI` 连上它、拉全量租户清单缓存到本地，之后定期轮询——与 5.5 节 Tracker 缓存吊销状态是**同一类读多写少的对象刷新**。各网络的桶凭据不落明文：以 KMS 信封加密存入，Tracker 只持 KMS 引用，解密结果仅存内存。
 
 即整个系统**从头到尾没有数据库**：网络的身份、索引、吊销在创建者的桶里；运营方的租户清单在运营方的桶里；Binding 与 `jti` 在 Punch 内存里。"Tracker 完全无状态"这句话的准确表述是：**不持有任何网络的业务状态**；它确实读运营元数据，但那是可缓存、可重建的。
 
@@ -406,6 +406,7 @@ Tracker 剩下三样东西：**签名密钥**（KMS）、**限流计数**（本�
 | `POST` | `/connections/relay` | relay_credentials：ICE 失败后换 TURN 凭据 | session JWT + connect JWT 本体（验 `grace_until`） |
 | `PUT` | `/punch/{punch_id}` | **Punch 注册 / 续期 / 容量上报**（5.3 节） | Punch 私钥签名 + 白名单 |
 | `DELETE` | `/punch/{punch_id}` | Punch 注销 | 同上 |
+| `GET` | `/punch/{punch_id}/revocations` | 拉取网络级吊销快照 / 增量（5.5 节） | Punch 私钥签名 + 白名单 |
 
 所有票据的 `iss` 为 `network_id`。Tracker **必须**拒绝为不属于本网络（`iss` 不匹配）的票据提供服务。
 
@@ -442,29 +443,46 @@ PUT /punch/{punch_id}
 
 沿用既有设计 §3.5 / §7.2.2：`punch.join` / `punch.heartbeat` / `punch.exit` / `punch.signal`，语义、信道模型（`binding_key`、`signal_key`、常驻 / 瞬时信道的区分）全部不变。唯一变化是**吊销状态的来源**——见 5.5 节。
 
-### 5.5 吊销分发：桶对象 + CDN 拉取
+### 5.5 吊销分发：Tracker 快照 API
 
-既有设计中 Punch 向 Tracker 查吊销状态，且要求 fail-closed（缓存未命中且 Tracker 不可达时拒绝）。这条依赖把 Tracker 的可用性放到了信令面的关键路径上。本文改为：
+Punch 是边缘服务，**不得直接访问桶**。桶仍是吊销记录的权威来源，但它只由 Tracker 读取；Punch 经 Tracker 的公开 API 拉取快照。这条边既保持了"网络状态在创建者桶里"，也让 Punch 不需要任何桶凭据。
 
 ```mermaid
 sequenceDiagram
     participant T as Tracker
-    participant B as 桶 + CDN
+    participant B as 创建者的桶
     participant P as Punch Server
 
     Note over T: revoke：写 net/revocations/<shard>.json<br/>（条件写，幂等）
     T->>B: PUT net/revocations/manifest.json（含各分片 ETag）
     loop 每个 Punch 每 30–60 s
-        P->>B: GET net/revocations/manifest.json（走 CDN）
-        P->>B: GET 变更的分片
-        P->>P: 更新本地 revoked 快照，记录 snapshot_at
+        P->>T: GET /punch/{punch_id}/revocations?cursor=...
+        T->>B: 缓存未命中或过期时读取 manifest / 变更分片
+        T-->>P: {items, cursor, snapshot_at}
+        P->>P: 更新本地 revoked 快照
     end
-    Note over P: join / signal(offer) 命中快照即拒绝<br/>Tracker 不可达不影响判定
+    Note over P: join / signal(offer) 命中快照即拒绝
 ```
 
-- Punch 本地维护一份 revoked 集合（按分片），`join` 与 `signal(offer)` 直接查内存。
-- **陈旧度约束**：`now - snapshot_at > REVOCATION_MAX_STALE`（建议 3600 s）时，Punch **必须** fail-closed（拒绝 `join` 与 `offer`）。由于数据源是对象存储 + CDN，其可用性远高于 Tracker 服务本身，这条路径在实践中几乎不会触发——这是相对既有设计的实质改进。
-- 既有设计中"revoke 时通知 Punch 清除 Binding"那条 MAY **删除**：有了轮询，它既无必要也无明确收益。
+`GET /punch/{punch_id}/revocations` 的最小契约：
+
+```text
+请求：
+  cursor: string?          上次成功同步后的不透明游标；为空表示要完整快照
+  timestamp, signature     sign(punch_private_key, method || path || cursor || timestamp)
+
+响应：
+  items: [{ key_fingerprint, revoked_at }]  完整快照或自 cursor 后的增量
+  cursor: string           下次请求使用的新游标
+  snapshot_at: unix seconds
+  full: bool               true 表示 items 是完整快照，客户端须先清空旧集合
+```
+
+- Tracker **必须**校验 Punch 的 `public_key` 在 `net/punches.json` 白名单里，并校验请求签名、时间窗口与 `punch_id`/公钥的一致性；这与 `PUT /punch/{punch_id}` 的认证方式一致。
+- Tracker **应当**在内存中缓存 manifest 与分片；缓存丢失只会触发从桶重新读取，不影响正确性。Tracker 因而仍不持有任何网络的持久业务状态。
+- Punch 本地维护一份 revoked 集合，`join` 与 `signal(offer)` 直接查内存；桶的可用性不再是 Punch 的直接依赖。
+- **陈旧度约束**：`now - snapshot_at > REVOCATION_MAX_STALE`（建议 3600 s）时，Punch **必须** fail-closed（拒绝 `join` 与 `offer`）。这时故障边界是"Tracker 快照 API 持续不可用或持续拿不到桶状态"，而不是单个 Tracker 实例短暂不可达——Tracker 可通过同一逻辑服务地址做负载均衡。
+- 既有设计中"revoke 时通知 Punch 清除 Binding"那条 MAY **删除**：定期拉取快照已足够，通知不是正确性依赖。
 - 规模：单个网络吊销记录通常极少（密钥泄露是罕见事件），全量对象通常只有几 KB；分片方案（`revocations/<shard>.json` + manifest）只在超大规模网络才需要启用。
 
 ### 5.6 残留窗口
@@ -580,6 +598,22 @@ SDK 侧按比例分流：**对照组不启用 P2P，实验组启用**。两组�
 
 开源在这里不是情怀，而是信任结构的一部分：它给了创建者退路——不满意就自己跑。这比任何 SLA 条款都更能回答"平台被攻破怎么办"。同时它也是 PaaS 的获客渠道：自建跑通、规模上来、不想运维了，就转成托管。
 
+### 9.1.1 PaaS 与自建版必须同构
+
+这是一条硬约束：**PaaS 版与自建版运行完全相同的 Tracker / Punch / TURN / Peer SDK 实现、网络协议与对象布局。** PaaS 不是另一条产品线，更不得引入 PaaS 专属的 JWT claim、信令消息、桶格式或 Peer 行为。
+
+两者的差异只允许存在于**协议外的管理面**：
+
+| 维度 | 自建 | PaaS |
+| --- | --- | --- |
+| 运行的二进制 / 容器镜像 | 创建者自行运行同一产物 | 运营方运行同一产物 |
+| 网络协议与 Peer SDK | 相同 | 相同 |
+| 桶授权 | 创建者把桶凭据 / 角色配置给自己的 Tracker | 创建者把桶角色授权给 PaaS 的 Tracker runtime |
+| 配置来源 | 本地配置或单网络 manifest | PaaS 租户清单（运营方自己的桶） |
+| 扩缩容、升级、监控、SLA、账单 | 创建者负责 | PaaS 负责 |
+
+因此迁移不应改变网络身份：创建者保留同一个桶、`network_id`、创建者密钥、`peer_id` 与种子文件，只把 `tracker_list` / Punch / TURN 的运行位置切换。客户端无需升级协议。PaaS 的租户清单、KMS 引用、配额与账单仅是**部署 bootstrap**，不得泄漏进网络协议。
+
 ### 9.2 混合部署矩阵
 
 协议的授权结构天然支持按组件拆分，不必全有或全无：
@@ -661,7 +695,7 @@ SDK 侧按比例分流：**对照组不启用 P2P，实验组启用**。两组�
 | 创建者作恶 | 审查、驱逐、窥视**本网络**元数据 | 这是他的网络，属于设计内权力；跨网络身份不受影响，用户可迁移到别的网络 |
 | 桶被攻破 / 误删 | 该网络元数据不可用 | 版本控制 + 对象锁；客户端需要明确的"网络不可用"降级 |
 | Tracker 被攻破 | 可签发任意票据、可写授权给它的对象 | 最小权限（3.5 / 3.6 节）：改不了 `descriptor.json` / `trackers.json` / `punches.json`；创建者删除角色即撤销，延迟 ≤ session duration |
-| Punch 被攻破 | 信令 DoS、 Binding 伪造（无法窃听数据） | 只持只读凭据；`aud` 绑定使票据不可跨 Punch 使用 |
+| Punch 被攻破 | 信令 DoS、 Binding 伪造（无法窃听数据） | **无桶凭据**；`aud` 绑定使票据不可跨 Punch 使用 |
 | 恶意 Peer 投递损坏数据 | 浪费带宽 | Merkle 校验 + 失败计数（沿用既有设计） |
 | 伪造 `leaf_hashes` / `proof_list` | 试图污染数据 | 本地重建 root 与 `info.root` 比对，不符则拒绝 |
 | 批量注册撑爆注册表 | 存储膨胀 | 沿用既有 #16 的建议：PoW / 邀请码 / 限流 |
@@ -679,7 +713,7 @@ SDK 侧按比例分流：**对照组不启用 P2P，实验组启用**。两组�
 | 4 | 引入 `net/trackers.json`（JWKS），`kid` 承载签发者身份 | 协议 |
 | 5 | 吊销范围从全局改为网络级 | 语义 |
 | 6 | login nonce 改为自包含挑战，Tracker 零持久状态 | 协议 |
-| 7 | Punch 吊销状态来源从 Tracker API 改为桶对象 + CDN 拉取 | 协议 |
+| 7 | Punch 吊销状态来源从逐请求点查改为 Tracker 吊销快照 API；Tracker 从桶读权威状态，Punch 无桶凭据 | 协议 |
 | 8 | 删除"revoke 通知 Punch 清 Binding"这条 MAY | 简化 |
 | 9 | 新增 `PUT /punch/{punch_id}` / `DELETE /punch/{punch_id}`（公开 API） | 新增 |
 | 10 | Punch 清单权威从 Tracker 迁到桶 `net/punches.json` | 架构 |
