@@ -369,7 +369,42 @@ t-c 已被提升为 owner
 → query 结果分裂
 ```
 
-##### 请求侧行为
+##### 请求入口与转发
+
+**Ingress 不是架构角色。** 多 Tracker 分片容易让人以为需要一个理解路由的网关；本文明确不引入它。控制集群对外只暴露一个**逻辑地址**，其背后可以是：
+
+```text
+单个 Tracker         self-hosted 小规模默认
+DNS 轮询 / anycast   无状态流量入口
+L4 / L7 LB          只做健康检查与转发
+```
+
+无论后面是哪一种，**任一 Tracker shard 都必须能作为入口**：
+
+```text
+请求到达 shard S
+  → S 用当前 ring manifest 计算 owner(R)
+  → S == owner     本地处理
+  → S != owner     内部转发给 owner，或返回 421 + Location
+```
+
+也就是说：
+
+```text
+每个 Tracker 同时是：
+  Ingress        接收客户端请求
+  Owner          处理自己负责的 resource_id
+  Forwarder      把不属于自己的请求转给当前 owner
+```
+
+这样 self-hosted 单节点时：
+
+```text
+Tracker 即入口、即 owner
+不需要任何网关或路由组件
+```
+
+###### 请求侧行为
 
 Ingress 可能仍持有旧 ring，因此：
 
@@ -377,11 +412,11 @@ Ingress 可能仍持有旧 ring，因此：
 query(R):
   打到旧 owner
   → 旧 owner 发现 R 已不属于自己
-  → 推荐内部转发给新 owner
-  → 或返回 421 / 重定向，客户端重试
+  → 默认：内部转发给新 owner
+  → 可选：返回 421 Misdirected Request + Location
 ```
 
-推荐**内部转发**，因为客户端不需要理解分片。
+默认应为**内部转发**，因为客户端不需要理解分片。
 
 announce 更敏感：
 
@@ -392,6 +427,27 @@ announce(R)
 ```
 
 **不得**出现两个 shard 同时接受同一资源的 announce，否则会双写并导致内存图分裂。
+
+###### 可选：客户端 owner 重定向缓存
+
+内部转发在稳定态会多一跳。PaaS 或大规模网络**可以**启用重定向缓存：
+
+```http
+421 Misdirected Request
+Location: https://t-c.example.com
+Ring-Epoch: 18
+```
+
+客户端收到后：
+
+```text
+1. 重试到 Location 指向的 owner
+2. 缓存 resource_id / hash range → owner endpoint
+3. 后续同资源或同范围请求直连 owner
+4. ring_epoch 变化后失效并重新学习
+```
+
+代价是客户端必须理解 `421 + Location` 并管理缓存失效，因此它**不得**作为默认要求；默认模型始终假设客户端只认识一个逻辑 Tracker 地址。
 
 ##### 后端差异与限制
 
@@ -1105,6 +1161,7 @@ P2P 控制服务的最小可迁移单元是 **Tracker + Punch 控制集群**，�
 | 18 | 存储抽象为 `MetadataStore` + `BlobStore` 逻辑键空间；S3 是默认后端，KV / SlateDB 等可作派生或替代实现 | 架构 |
 | 19 | 新增控制集群配置存储：ring manifest、lease / fencing 与 Punch 拓扑共用存储抽象，但不进入网络 bucket（3.2.1 节） | 架构 |
 | 20 | 多 Tracker 分片迁移协议：rendezvous hash + handoff 状态机 + ring_epoch / lease，禁止直接切 ring | 架构 |
+| 21 | 明确 ingress 不是架构角色：控制集群只暴露逻辑地址，任一 Tracker 兼入口并按 ring 转发；421 重定向缓存仅作可选优化 | 架构 |
 
 ## 12. 未决问题
 
