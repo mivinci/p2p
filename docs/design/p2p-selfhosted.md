@@ -450,10 +450,46 @@ trust_bundle = {
 }
 ```
 
-Punch 对 bundle 只执行通用能力验证：按 `(network_id, kid)` 找验签键，检查 `iat > revoked_at`，并按可选 `max_bindings` 计数。它不关心这些条目来自哪个 Tracker、哪个桶或哪项业务。
+Punch 对 bundle 只执行通用能力验证：按 `(network_id, kid)` 找验签键，检查 `aud == punch_id`、`iat > revoked_at` 与可选 `max_bindings`。它不关心这些条目来自哪个 Tracker、哪个桶或哪项业务。
 
-- **PaaS**：控制面从网络桶同步 `trackers.json` / `revocations/*`，生成并推送 bundle；同时维护 Punch fleet 的拓扑、健康与共享容量。
-- **自建**：维护者用同一格式的配置文件、配置热更新或 `punchctl apply` 下发 bundle。Punch 二进制、bundle 格式与行为与 PaaS 完全相同。
+#### PaaS Punch 的服务授权交集
+
+**网络授权 Tracker 不等于有权使用 PaaS Punch。** `net/trackers.json` 只表达"谁可以为该网络签发协议票据"；PaaS Punch 是平台的付费基础设施，必须再经过平台产品授权。否则创建者只要把任意 Tracker 公钥加入桶，就能绕过套餐使用公共 Punch 池。
+
+PaaS 控制面为每个已开通 Punch 的网络维护协议外的 entitlement：
+
+```text
+punch_entitlement = {
+  network_id,
+  allowed_tracker_kids: [kid...],
+  allowed_punch_pools: [pool_id...],
+  max_bindings,
+  expires_at
+}
+```
+
+对某个 PaaS Punch 实例，管理面只把以下**交集**编译进 bundle：
+
+```text
+effective_issuers(punch) = {
+  key ∈ active_keys(network bucket / net/trackers.json)
+  | key.kid ∈ entitlement.allowed_tracker_kids
+  && punch.pool_id ∈ entitlement.allowed_punch_pools
+}
+```
+
+因此 Punch 本地接受一个 `punch` 或 `connect` capability 的完整条件是：
+
+```text
+(iss = network_id, kid) ∈ effective_issuers(punch)
+&& aud == punch.punch_id
+&& scope / nbf / exp / iat / revoked_at / quota 均有效
+```
+
+未知 Tracker 的 `kid` 不在 bundle，会在验签前被拒绝；即使某 Tracker 已被网络创建者授权，只要它不在该网络的 PaaS entitlement 交集里，也无法消耗 PaaS Punch 资源。`aud` 进一步阻止一张票据被拿到另一台 Punch 使用。
+
+- **PaaS**：控制面从网络桶同步 `trackers.json` / `revocations/*`，与 entitlement 求交后生成并推送 bundle；同时维护 Punch fleet 的拓扑、健康与共享容量。
+- **自建**：维护者直接用同一 bundle 格式配置允许的 issuer、撤销和配额；没有 PaaS entitlement 服务，也就没有第二道产品授权，但最终下发给 Punch 的 schema 与验证逻辑不变。
 - bundle 的最大陈旧度超过 `TRUST_BUNDLE_MAX_STALE`（建议 3600 s）时，Punch **必须** fail-closed：拒绝新的 `join` 与 `offer`，但不得中断已建立的 Binding 或 DataChannel。
 - "revoke 时通知 Punch 清除 Binding"不是网络协议的一部分：控制面是否主动推送是实现优化，正确性只依赖于 bundle 的陈旧度上限。
 
@@ -534,6 +570,8 @@ punches: [{
 Tracker 通过 `punch.healthz` 主动探测这些候选，基于健康、区域与权重选择 Punch；它不接收 Punch 注册，也不把 Punch 的在线状态回写网络桶。
 
 管理面向 Punch 下发第 5.5 节的 trust bundle 与可选网络配额。Punch 共享全局容量；管理面**可以**为每个 `network_id` 分配 `max_bindings`，避免一个网络耗尽公共 Punch 池。Tracker 的选择只是预筛，Punch 在 `join` 时是容量的最终裁决者。
+
+对 PaaS，管理面还必须维护网络的 Punch entitlement，并只将"网络 JWKS ∩ entitlement ∩ 当前 Punch pool"编译进 bundle。**不得**把桶中全部 Tracker key 无条件下发给公共 Punch 池；否则网络级授权会意外升级为平台基础设施使用权。
 
 PaaS 与 self-hosted 运行完全相同的 Tracker / Punch 二进制与配置 schema：
 
@@ -697,6 +735,7 @@ SDK 侧按比例分流：**对照组不启用 P2P，实验组启用**。两组�
 | 桶被攻破 / 误删 | 该网络元数据不可用 | 版本控制 + 对象锁；客户端需要明确的"网络不可用"降级 |
 | Tracker 被攻破 | 可签发任意票据、可写授权给它的对象 | 最小权限（3.5 / 3.6 节）：改不了 `descriptor.json` / `trackers.json`；创建者删除角色即撤销，延迟 ≤ session duration |
 | Punch 被攻破 | 信令 DoS、 Binding 伪造（无法窃听数据） | **无桶凭据**；`aud` 绑定使票据不可跨 Punch 使用 |
+| 未授权 Tracker 使用 PaaS Punch | 白嫖公共 Punch 池或挤占容量 | trust bundle 只含「网络 JWKS ∩ PaaS entitlement ∩ Punch pool」的 issuer；本机再验 `aud=punch_id` 与配额 |
 | 恶意 Peer 投递损坏数据 | 浪费带宽 | Merkle 校验 + 失败计数（沿用既有设计） |
 | 伪造 `leaf_hashes` / `proof_list` | 试图污染数据 | 本地重建 root 与 `info.root` 比对，不符则拒绝 |
 | 批量注册撑爆注册表 | 存储膨胀 | 沿用既有 #16 的建议：PoW / 邀请码 / 限流 |
@@ -717,7 +756,7 @@ SDK 侧按比例分流：**对照组不启用 P2P，实验组启用**。两组�
 | 7 | Punch 不读桶、不注册网络、不向 Tracker 拉业务状态；控制面下发通用 trust bundle | 架构 |
 | 8 | 删除"revoke 通知 Punch 清 Binding"这条 MAY | 简化 |
 | 9 | 新增通用 Punch RPC `punch.healthz`，Tracker 主动探测候选 Punch | 新增 |
-| 10 | Punch / TURN 拓扑、健康与配额从网络桶迁至基础设施管理面 | 架构 |
+| 10 | Punch / TURN 拓扑、健康与配额从网络桶迁至基础设施管理面；PaaS 以 entitlement 把网络授权与平台服务授权取交集 | 架构 |
 | 11 | announce TTL 建议从 30 分钟放宽到 ≥ 3 小时（在线性由 Punch 承担） | 参数 |
 | 12 | 计量基准改为桶出向流量 + A/B 对照，遥测降级为归因 | 产品 |
 | 13 | 数据面（Merkle / chunk / 调度 / TURN 回退） | **不变** |
