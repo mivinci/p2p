@@ -231,6 +231,180 @@ trait BlobStore {
 - PaaS 中的 Redis / RocksDB / SlateDB 只能是**可重建的物化视图或加速器**，不得成为网络唯一真相；
 - 迁移后端时 `resource_id`、`peer_id`、种子与协议行为不变。
 
+#### 3.2.1 控制集群配置存储
+
+网络 bucket 只保存**网络业务状态**。控制集群自身的成员、分片、租约与 Punch 拓扑属于**基础设施状态**，**不得**写入网络 bucket；但两者**可以**共用同一套 `MetadataStore` / `BlobStore` 抽象，只是键空间不同。
+
+```text
+cluster/
+  ring.json                 ring manifest：成员、权重、status、ring_epoch、ring_version
+  leases/<tracker_id>.json  owner lease：holder、ring_epoch、expires_at、fencing_token
+  punch/<punch_id>.json     Punch endpoint、region、weight、expected public key
+  topology.json             可选：控制集群整体视图
+```
+
+后端映射示例：
+
+| 后端 | 控制集群配置位置 |
+| --- | --- |
+| S3 / R2 / MinIO / COS | `s3://<ops-bucket>/cluster/...` |
+| 本地文件 / ConfigMap | `/etc/p2p/cluster/...` |
+| SQLite / RocksDB | `cluster:ring`、`cluster:lease:<id>` |
+| PaaS | 控制面写入同一 keyspace 或等价配置服务 |
+
+Self-hosted 与 PaaS 的差异仍然只是**谁写这份配置**：前者由维护者 / GitOps / 部署系统写，后者由平台控制面写；Tracker runtime 的读取与迁移逻辑完全相同。
+
+##### ring manifest
+
+```text
+{
+  v: 1
+  ring_epoch: 18                 成员集合世代，成员变化时必须递增
+  ring_version: 7                同一 epoch 内的配置修订号
+  algorithm: "rendezvous-v1"
+  updated_at: <unix seconds>
+  shards: [
+    { tracker_id: "t-a", endpoint: "https://t-a.example.com", weight: 100, status: "active" },
+    { tracker_id: "t-c", endpoint: "https://t-c.example.com", weight: 100, status: "joining" }
+  ]
+}
+```
+
+`status` 至少区分：
+
+```text
+active     正常服务
+joining    新加入，正在从桶 hydrate 应负责资源
+draining   即将不再负责某些资源，停止接收新写入
+removed    已从成员集合移除
+```
+
+##### Tracker 如何知道要重新 hash
+
+一致性哈希只解决“给定成员集合，如何算 owner”，不解决“成员变化如何被发现”。因此：
+
+1. 每个 Tracker shard **应当**周期读取 `cluster/ring.json`；
+2. 发现 `ring_epoch` 或 `ring_version` 变化后，用同一确定性算法重算：
+   - 自己现在负责哪些 `resource_id`；
+   - 哪些要迁出；
+   - 哪些要迁入；
+3. 进入 handoff 状态机。
+
+也就是说，被影响的 Tracker 不是被逐个通知“你负责 R3”，而是**每个节点按同一 manifest 自行算出**“我负责 R3”。这避免了中心调度器逐资源下发指令。
+
+##### handoff 状态机
+
+每个受影响的资源都应经历：
+
+```text
+1. Old owner active
+   旧 owner 继续服务；写仍然先落桶。
+
+2. New owner warming
+   新 owner 从桶 hydrate：
+     LIST announcements/<resource_id>/
+     建立本地 resource → peers
+   此时不接受该资源的写入，只预热。
+
+3. Old owner draining
+   停止接收该资源的新写入，drain 在途请求；
+   旧 owner 仍可读，直到切换完成。
+
+4. Final sync
+   新 owner 再回源桶同步一次，覆盖 drain 期间完成的写入。
+
+5. Switch
+   更新 lease / 有效 owner 标记；新 owner 开始接受 announce 与 query。
+
+6. Cleanup
+   旧 owner 删除该资源的本地邻接表。
+```
+
+本地资源归属**应当**显式建模，而不是只存候选集合：
+
+```rust
+enum OwnershipState {
+    Unknown,
+    Active,
+    Warming { from_epoch: u64 },
+    Draining { to: TrackerId, until: Instant },
+    ReadOnly,
+}
+```
+
+| 状态 | query | announce |
+| --- | --- | --- |
+| `Active` | 本地读 | 本地写 |
+| `Warming` | 可从桶读并 hydrate | 转发给旧 owner，或返回可重试错误 |
+| `Draining` | 仍可读 | 拒绝新写，返回重定向 |
+| `ReadOnly` | 可读 | 拒绝 |
+
+##### lease 与 fencing
+
+ring manifest 只回答“谁应该是 owner”；**不回答**“谁现在真的能写”。因此还需要：
+
+```text
+{
+  holder: "t-a"
+  ring_epoch: 18
+  expires_at: <unix seconds>
+  fencing_token: 91         单调递增
+}
+```
+
+规则：
+
+1. 只有持有未过期 lease 的 shard 才能作为 owner 写入；
+2. lease 必须周期续租，续租用 `put_if_version` 条件写；
+3. CAS 失败说明 lease 已被他人取得，本 shard 必须退化为 `ReadOnly` / `Draining`；
+4. `ring_epoch` 不匹配或 lease 过期时，立即停止写入；
+5. `fencing_token` 单调递增，旧 owner 的迟到写入必须被拒绝。
+
+否则会出现双 owner：
+
+```text
+t-a 以为自己还是 owner
+t-c 已被提升为 owner
+→ 两边都更新自己的内存图
+→ query 结果分裂
+```
+
+##### 请求侧行为
+
+Ingress 可能仍持有旧 ring，因此：
+
+```text
+query(R):
+  打到旧 owner
+  → 旧 owner 发现 R 已不属于自己
+  → 推荐内部转发给新 owner
+  → 或返回 421 / 重定向，客户端重试
+```
+
+推荐**内部转发**，因为客户端不需要理解分片。
+
+announce 更敏感：
+
+```text
+announce(R)
+  → 旧 owner 不得再接受
+  → 必须转发给新 owner，或明确拒绝并要求重试
+```
+
+**不得**出现两个 shard 同时接受同一资源的 announce，否则会双写并导致内存图分裂。
+
+##### 后端差异与限制
+
+| 后端 | 适合做 ring manifest | 适合做 lease / fencing | 说明 |
+| --- | --- | --- | --- |
+| S3 / R2 | 是 | 可以，但延迟较高 | lease TTL 需更长，切换较慢 |
+| 本地文件 / ConfigMap | 是 | 弱 | 适合单节点，或外部已有发布系统 |
+| SQLite / RocksDB | 是 | 单机内强，跨机弱 | 多机时需外部一致性来源 |
+| DynamoDB | 是 | 很适合 | conditional update 天然可做 lease |
+| etcd / Consul | 是 | 很适合 | 本文不引入为默认依赖 |
+
+因此结论是：**一致性哈希不是零协调方案。** 它只减少扩缩容时需要迁移的资源数量，不消除成员管理、epoch 协调、lease / fencing、handoff 与回源 hydrate。PaaS 若需要高频自动扩缩容，Redis / 共享物化图可能比自研这套分片迁移更简单；若坚持无 Redis，就必须接受这是一套小型分布式索引系统。
+
 ### 3.3 读写频率分层
 
 桶适合"低频、大、权威、可缓存"的数据。**决定成败的设计约束是：不要把高频写放进桶。**
@@ -336,6 +510,7 @@ HashMap + SlotMap / generational arena + EdgeId 双向邻接
 
 - `resource → peers` 可保持强一致视图；
 - `peer → resources` 天然跨 shard，不应作为跨集群强一致索引；
+- 成员、ring manifest、lease / fencing 与 handoff 状态机见 3.2.1 节；
 - 扩缩容**不得**直接切换 hash ring，必须 handoff：旧 owner 服务 → 新 owner 从桶 hydrate → 栅栏 → 切换 `ring_epoch`；
 - 冷资源或接管 shard 的首次 query **必须**能回源桶，只允许变慢，不允许漏候选。
 
@@ -568,6 +743,9 @@ Tracker 的启动配置承载控制集群和网络状态访问能力：
 | 签票身份 | `admission_authority_key_ref` | 是 | 控制集群私钥 `K_cluster.private`，签发 `punch` / `connect` capability | 本地 Secret / KMS | PaaS KMS |
 | 签票身份 | `admission_authority_kid` | 是 | 当前签票密钥 `kid`；必须已被网络 `trackers.json` 授权 | 本地配置 | 平台租户配置 |
 | 网络接入 | `network_config_ref` | 是 | `network_id → bucket_uri + credential_ref + 网络策略` 映射 | 本地配置 / GitOps | 控制面下发运行配置 |
+| 集群成员 | `cluster_config_ref` | 是 | 控制集群配置：`cluster/ring.json`、`leases/`、Punch 拓扑（3.2.1 节） | 本地文件 / 运维对象存储 | 控制面或配置服务 |
+| 集群成员 | `ring_poll_interval` | 否 | 拉取 ring manifest 的周期，建议 5–30 s | 默认或本地配置 | 平台策略 |
+| 集群成员 | `lease_ttl` / `lease_renew_interval` | 否 | owner lease 的 TTL 与续租周期；S3 等慢后端需更长 TTL | 默认或本地配置 | 平台策略 |
 | 网络接入 | `bucket_credential_provider` | 是 | 取得创建者桶临时凭据；运行时可缓存、不得落盘 | AssumeRole / 本地云凭据 | KMS + AssumeRole |
 | Punch 候选 | `punch_candidates_ref` | 是 | `punch_id`、endpoint、expected public key、region、weight | 维护者配置 | 服务发现 / 平台调度 |
 | Punch 健康 | `punch_health_interval` | 否 | `punch.healthz` 探测周期，建议 10–30 s | 默认或本地配置 | 平台策略 |
@@ -925,6 +1103,8 @@ P2P 控制服务的最小可迁移单元是 **Tracker + Punch 控制集群**，�
 | 16 | 桶对象布局改为实体 / 关系分离：`resources/<id>/{info,data,hashes}`、`peers/<id>/info.json`、`announcements/<rid>/<pid>.json` | 架构 |
 | 17 | announcement 边从裸声明改为带 `state` / `generation` 的状态对象；`del` 用 tombstone 代替物理删除 | 协议 |
 | 18 | 存储抽象为 `MetadataStore` + `BlobStore` 逻辑键空间；S3 是默认后端，KV / SlateDB 等可作派生或替代实现 | 架构 |
+| 19 | 新增控制集群配置存储：ring manifest、lease / fencing 与 Punch 拓扑共用存储抽象，但不进入网络 bucket（3.2.1 节） | 架构 |
+| 20 | 多 Tracker 分片迁移协议：rendezvous hash + handoff 状态机 + ring_epoch / lease，禁止直接切 ring | 架构 |
 
 ## 12. 未决问题
 
