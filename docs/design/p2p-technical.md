@@ -419,7 +419,7 @@ TURN 的选型必须显式评估其**按 allocation 约束对端地址**的能�
 
 TURN 只转发密文流量（DTLS），不能成为内容可信边界。凭据只发给请求方自身；TURN 或其前置授权网关**必须**只允许该连接的配对端点，若所选标准 TURN 实现无法约束 peer 地址，则**必须**由前置网关实施该策略。
 
-**Phase 1 的显式技术债**：per-allocation 对端约束在标准 TURN 实现上拿不到，Phase 1 接受其残留风险——TURN 可被用作转发到任意地址的开放中继，靠短期凭据、per-peer 配额与审计日志抑制滥用。是否投入前置网关（解析 CreatePermission / ChannelBind 并做动态决策）由 relay 占比的实测数据决定：直连成功率高、relay 占比在个位数时，该投入不划算；反之才值得做。relay 带宽由运营方承担，占比同时是成本模型的输入（见产品规划的风险表）。
+**Phase 1 的显式技术债**：per-allocation 对端约束在标准 TURN 实现上拿不到，Phase 1 接受其残留风险——TURN 可被用作转发到任意地址的开放中继，靠短期凭据、per-peer 配额与审计日志抑制滥用。是否投入前置网关（解析 CreatePermission / ChannelBind 并做动态决策）由 relay 占比的实测数据决定：直连成功率高、relay 占比在个位数时，该投入不划算；反之才值得做。relay 带宽的承担方与占比同时是成本模型的输入（见 issue #11；承担方的归属方案见 `p2p-selfhosted.md` §7.4）。
 
 ## 5. 种子文件与磁力链
 
