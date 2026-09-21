@@ -83,9 +83,10 @@ network_id = "s3://my-bucket"
 ```text
 {
   v: 1
-  network_id: "s3://my-bucket/net/demo"
+  network_id: "s3://my-bucket"
   name: "...", description: "..."        展示用
   created_at: <unix seconds>
+  seq: <u64>                             单调递增，防回滚（见 3.6.4 节）
   creator_public_key: <32B>              创建者公钥，用于验签本文件与 trackers.json
   signature: <64B>                       sign(creator_key, canonical(本文件除 signature 外))
 }
@@ -260,16 +261,34 @@ Deny 优先，因此"Tracker 改不了谁有权签发"是**云厂商强制的**�
 
 #### 3.6.3 不同存储的差异
 
-| 存储 | 前缀级策略 | 结论 |
-| --- | --- | --- |
-| AWS S3 | 支持（IAM policy + `s3:prefix`） | 完整实现 3.5 节矩阵 |
-| MinIO | 支持（policy 的 Resource 前缀匹配） | 同上 |
-| 腾讯云 COS | 支持（CAM 的 resource 前缀） | 同上 |
-| Cloudflare R2 | **不支持**（token 粒度为桶级） | 只能做桶级最小权限 ⇒ **必须一网络一桶** |
+各类存储提供的是**四种不同的能力**，不要混为一谈：
 
-也就是说：3.5 节的按前缀最小权限**不是通用保证**，它依赖存储能力。采用一网络一桶（2.1 节）可以让所有存储上的隔离强度一致，这也是本文推荐它的主要原因。
+| 存储 | 长期凭据粒度 | 前缀 / 对象级短期凭据 | 防删改 | 对象级审计 |
+| --- | --- | --- | --- | --- |
+| AWS S3 | IAM policy（支持前缀） | 是（STS AssumeRole + session policy） | 版本控制 + Object Lock（WORM） | CloudTrail 数据面事件 |
+| MinIO | policy（Resource 前缀匹配） | 是（STS） | 版本控制 | 审计 webhook |
+| 腾讯云 COS | CAM（resource 前缀） | 是（STS） | 版本控制 | 云审计 |
+| Cloudflare R2 | **token 为桶级**（读 / 读写） | 是，但须由父 token 调 `temp-access-credentials` 派生 | Bucket Locks（**前缀级** retention，阻止删除与覆盖） | Data Access Logs（对象级，但官方声明为 best-effort，可能延迟或丢失） |
 
-> 未决：是否要针对 R2 定义一套"退化但仍可用"的授权形态（例如接受 Tracker 持有整个桶的写权限，改用审计 + 快速撤销来补偿）。见第 12 章未决问题 10。
+因此 3.5 节的按前缀最小权限**在所有这些存储上都能实现，但机制不同**：S3 / MinIO / COS 靠存储的授权策略；R2 靠"父 token → `temp-access-credentials`"派生。差异在于**派生的代价**——R2 每次派生都需要父 token，而父 token 是桶级的长期凭据。这带来一个绕不开的问题：
+
+- 若凭据有 TTL 且需自动续期，就必须长期持有父 token，于是"Tracker 只拿到前缀级短期凭据"的好处被一个**持有桶级凭据的签发组件**抵消；
+- 该组件可以做得很小、很集中（一个凭据代理，只做签发与审计），但它一旦失守，后果等同于整桶写权限。
+
+R2 上另一条独立可用的能力是 **Bucket Locks**：按前缀设置 retention，阻止对象的删除与覆盖。它不区分调用者（创建者自己也被拦），因此适合保护**极少变更**的对象，更新时需先移除规则。
+
+> 未决：R2 路线上是否引入凭据代理（父 token 集中保管 + 派生前缀级短期凭据），以及 `temp-access-credentials` 的 TTL 上限能否支撑"创建者授权一次、长期运行"。见第 12 章未决问题 10。
+
+#### 3.6.4 主权对象的完整性不依赖存储授权
+
+无论采用哪种存储与授权机制，以下三个对象——`net/descriptor.json`、`net/trackers.json`、`net/punches.json`——的完整性由**创建者签名**保证（2.1 与 4.3 节），而不是由存储 ACL 保证：攻击者即便持有整桶写权限，没有创建者私钥也伪造不出合法签名，读取方验签即拒绝。
+
+因此存储侧的最小权限是**纵深防御的第二层**，不是唯一防线。由此产生两条**必须**满足的协议要求：
+
+1. **验签是强制项**。所有读取这三个对象的组件（Punch、客户端、其他 Tracker）**必须**校验创建者签名，**不得**因为"存储侧已经做了 ACL"而省略。
+2. **防回滚**。签名无法阻止"把对象换成旧的合法版本"（例如恢复一个已被移除的 Tracker 公钥）。因此这三个对象**必须**携带单调递增的 `seq`，读取方记住见过的最大值，`seq` 回退即拒绝。
+
+此外，**删除**是签名防不住的攻击面（删掉 `net/trackers.json` 即可让网络瘫痪）。它只能靠存储能力缓解：S3 用版本控制 + MFA delete，R2 用 Bucket Locks。这是 3.6.3 节之外、需要在部署清单里单独列出的一项。
 
 ## 4. 身份与密钥
 
@@ -292,7 +311,8 @@ Deny 优先，因此"Tracker 改不了谁有权签发"是**云厂商强制的**�
 ```text
 {
   v: 1
-  network_id: "s3://my-bucket/net/demo"
+  network_id: "s3://my-bucket"
+  seq: <u64>                          单调递增，防回滚（见 3.6.4 节）
   keys: [ { kid: "t1-2026-09", alg: "EdDSA", public_key: <32B>, created_at, status: "active" },
           { kid: "t1-2026-06", alg: "EdDSA", public_key: <32B>, status: "retired" } ]
   signature: <64B>    sign(creator_public_key, canonical(本文件除 signature 外))
@@ -655,7 +675,7 @@ SDK 侧按比例分流：**对照组不启用 P2P，实验组启用**。两组�
 7. **吊销列表的分片阈值**：建议先做全量对象，超过多少条才启用分片需实测。
 8. **产品规划需在新定位下重写**。随单租户模型一起失效的是定价、成本与盈利模型（已由第 8 章计量与第 9 章计费接管）；仍需要的是三块：Client SDK 的平台与语言面、MVP 实施路径、以及**合规责任分配**——自建网络下合规责任主体从运营方转为网络创建者，这一条比原模型更关键，需要单独定义（创建者须知、侵权投诉入口、日志留存边界）。
 9. **是否允许创建者调整影响桶费用的参数**？announce TTL、LIST 缓存时长直接决定他的云账单（9.6 节）。放开调参能帮大客户省钱，但会让成本估算与容量规划变复杂；也可能出现"调长 TTL 导致 query 命中率下降"的互相埋怨。
-10. **不支持前缀级策略的存储（如 R2）如何取舍**？默认答案是要求一网络一桶（2.1 / 3.6.3 节）；若允许多网络共用桶，是否接受"Tracker 持有整桶写权限、改用审计与快速撤销补偿"的退化形态？
+10. **R2 路线怎么走**（3.6.3 节）。三个选项：① 一网络一桶 + 桶级 token（只拿到跨网络隔离，桶内无最小权限）；② 单桶 + 整桶 token + 签名 / Bucket Locks / 审计补偿（配置最简，但审计在 R2 上是 best-effort）；③ 引入凭据代理（集中保管父 token，派生前缀级短期凭据给 Tracker，父 token 永不进 Tracker 进程）。还要确认 `temp-access-credentials` 的 TTL 上限能否支撑"授权一次、长期运行"。
 11. **授权引导是产品必做项**。手动创建 IAM 角色与 `ExternalId` 与"每个人都能创建一个网络"直接矛盾。**必须**提供一键引导（生成 `network_id` 与 `ExternalId`、给出 CloudFormation / Terraform 模板或 R2 的 token 创建指引）；本文只提出要求，交互形态属产品范畴。
 
 ## 13. 参考资料
