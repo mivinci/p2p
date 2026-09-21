@@ -406,6 +406,27 @@ Tracker 剩下三样东西：**签名密钥**（KMS）、**限流计数**（本�
 
 `POST /connections/relay` 与既有设计的无状态授权一致：Tracker 不保存 connection 记录，直接验 connect JWT 本体（签名 + `sub`/`target` + `info_hash` + `now <= grace_until`，**不验** `exp`）。常量关系沿用 `ICE_TIMEOUT(20s) < CONNECT_JWT_EXP(60s) < RELAY_GRACE(900s)`。
 
+#### Tracker runtime 配置边界
+
+Tracker 的启动配置承载控制集群和网络状态访问能力：
+
+| 类别 | 参数 / 配置 | 必需 | 含义 | Self-hosted 来源 | PaaS 来源 |
+| --- | --- | --- | --- | --- | --- |
+| 签票身份 | `admission_authority_key_ref` | 是 | 控制集群私钥 `K_cluster.private`，签发 `punch` / `connect` capability | 本地 Secret / KMS | PaaS KMS |
+| 签票身份 | `admission_authority_kid` | 是 | 当前签票密钥 `kid`；必须已被网络 `trackers.json` 授权 | 本地配置 | 平台租户配置 |
+| 网络接入 | `network_config_ref` | 是 | `network_id → bucket_uri + credential_ref + 网络策略` 映射 | 本地配置 / GitOps | 控制面下发运行配置 |
+| 网络接入 | `bucket_credential_provider` | 是 | 取得创建者桶临时凭据；运行时可缓存、不得落盘 | AssumeRole / 本地云凭据 | KMS + AssumeRole |
+| Punch 候选 | `punch_candidates_ref` | 是 | `punch_id`、endpoint、expected public key、region、weight | 维护者配置 | 服务发现 / 平台调度 |
+| Punch 健康 | `punch_health_interval` | 否 | `punch.healthz` 探测周期，建议 10–30 s | 默认或本地配置 | 平台策略 |
+| TURN | `turn_config_ref` | 是 | TURN server 列表、区域映射与 relay 凭据签发配置 | 本地配置 | PaaS TURN pool 配置 |
+| 协议策略 | `max_query_candidates` | 否 | 单次 query 的候选上限，建议 10 | 默认或本地配置 | 平台套餐策略 |
+| 协议策略 | `rate_limit_config_ref` | 否 | register / login / query / announce 限流；本地可丢失 | 本地配置 | 平台策略 |
+| 缓存 | `network_state_cache_ttl` | 否 | descriptor、JWKS、资源索引与吊销记录的本地缓存 TTL | 默认或本地配置 | 平台策略 |
+| 网络监听 | `listen_addresses` | 是 | Tracker REST API 监听地址 | 本地部署配置 | PaaS LB / Service 配置 |
+| 观测 | `log_level`、`metrics_config` | 否 | 日志、指标与 trace | 维护者配置 | 平台观测系统 |
+
+Tracker **可以**理解 `network_id`、桶和网络策略，因为它是 P2P 协议控制面与网络业务状态的读写代理；这些参数不得进入 Punch runtime。
+
 ### 5.3 Punch 健康探测：`punch.healthz`
 
 Punch 是通用的 Binding 与信令基础设施，**不理解 Tracker、桶、资源、peer 归属或网络业务**。它不向 Tracker 注册；Tracker 从基础设施管理面取得候选 Punch 配置后，主动探测其健康状态。
@@ -428,17 +449,20 @@ punch.healthz({ request_id })
 
 Punch 的启动配置只允许包含基础设施级信息：
 
-```text
-identity_key_ref
-listen_addresses
-admission_authority_public_keys
-max_bindings
-max_pending_signals
-max_bindings_per_peer
-max_pending_per_ip
-```
+| 类别 | 参数 / 配置 | 必需 | 含义 | Self-hosted 来源 | PaaS 来源 |
+| --- | --- | --- | --- | --- | --- |
+| 实例身份 | `identity_key_ref` | 是 | Punch 长期私钥，用于服务器认证 | 本地 Secret / KMS | PaaS KMS |
+| 实例身份 | `punch_id` | 否，建议派生 | `punch_id = f(identity_public_key)`；不得人工填写，避免 `aud` 与密钥身份错配 | 自动派生 | 自动派生 |
+| 网络监听 | `listen_addresses` | 是 | QUIC / TCP+TLS 等加密 RPC 监听地址 | 本地部署配置 | PaaS LB / Service 配置 |
+| Admission 信任 | `admission_authorities_ref` | 是 | 本控制集群 admission authority 公钥集合 `[K_cluster.public, K_previous.public]` | 本地配置 / Secret | 平台配置 |
+| Admission 容量 | `max_bindings` | 是 | 全局最大 Binding 数 | 维护者配置 | 平台调度配置 |
+| Admission 容量 | `max_pending_signals` | 是 | 最大挂起信令连接数 | 维护者配置 | 平台调度配置 |
+| Admission 防护 | `max_bindings_per_peer` | 否 | 单 Peer 最大 Binding 数 | 默认或本地配置 | 平台策略 |
+| Admission 防护 | `max_pending_per_ip` | 否 | 单 IP 最大挂起信令数 | 默认或本地配置 | 平台策略 |
+| 实例状态 | `drain` | 否 | 排水时 `punch.healthz.ready=false`，拒绝新的 `join` / `offer` | 运维操作 | 发布系统 |
+| 观测 | `log_level`、`metrics_config` | 否 | 日志、指标与 trace | 维护者配置 | 平台观测系统 |
 
-`punch_id` **应当**由 identity public key 派生，而非人工填写，避免 `aud` 与密钥身份错配。配置中**不得**出现 `network_id`、Tracker URL、桶 URI / 凭据、资源索引、撤销游标、网络级 issuer 或 PaaS 套餐信息。authority 公钥轮换是普通部署配置更新：短暂保留新旧公钥并行即可，不需要每网络 bundle。
+配置中**不得**出现 `network_id`、Tracker URL、桶 URI / 凭据、资源索引、撤销游标、网络级 issuer 或 PaaS 套餐信息。authority 公钥轮换是普通部署配置更新：短暂保留新旧公钥并行即可，不需要每网络 bundle。
 
 初始 authority 配置无效、监听未就绪、实例排水或全局 admission 已满时，`punch.healthz.ready` 为 false，且 Punch 拒绝新 `join` / `offer`；已有 Binding 与 DataChannel 不受影响。
 
