@@ -164,7 +164,7 @@ files/<hh>/<info_hash>.hashes                叶子哈希列表（proof_list 目
 | --- | --- | --- | --- |
 | 文件字节、`*.hashes` | 写一次，读很多 | 桶 | 天然 CDN 缓存 |
 | `descriptor` / `trackers` | 极低频写，高频读 | 桶 + CDN | 创建者控制面 |
-| 吊销记录 | 极低频写，高频读 | 桶 + Tracker 缓存 + Punch trust bundle | Punch 只消费控制面下发的通用撤销状态 |
+| 吊销记录 | 极低频写，Tracker 高读 | 桶 + Tracker 缓存 | Tracker 停签新短票据；Punch 不读取网络撤销表 |
 | 身份注册 | 每 peer 每 90 天写一次，login 时读 | 桶 | 低频 |
 | 资源声明 | 每 peer 每 TTL 写一次 | 桶 | **TTL 必须足够长**，见 3.4 |
 | Punch 拓扑 / 健康 / 配额 | 管理面低频变更 + 高频探测 | **管理面 + Tracker 内存** | 基础设施状态，不属于网络桶 |
@@ -175,13 +175,13 @@ files/<hh>/<info_hash>.hashes                叶子哈希列表（proof_list 目
 
 ### 3.3 一致性、并发与原子性
 
-现代对象存储对 PUT / GET / LIST 都是写后读一致（S3 自 2020 年起，R2、MinIO 等同样），因此"Tracker 写完 Punch 立刻能读到"成立。仍需注意：
+现代对象存储对 PUT / GET / LIST 都是写后读一致（S3 自 2020 年起，R2、MinIO 等同样），因此"Tracker 写完，后续任一 Tracker 立刻能读到"成立。仍需注意：
 
 1. **没有事务**。跨对象的原子性不存在，只能靠对象拆分规避。
 2. **覆盖是 last-writer-wins**。因此**资源索引必须拆成"每 peer 一对象"**——若做成单对象并发追加，两个 peer 同时 announce 会互相覆盖。
 3. **条件写可用**：`If-None-Match: *` 可实现"不存在才写"（原子创建），`If-Match: <ETag>` 可实现乐观锁。这两者足以实现吊销记录的幂等写入。
 4. **LIST 分页**：`net/resources/<info_hash>/` 下可能有数万个对象，query **必须**分页（每次 1000 key）并**应当**在 Tracker 侧做短 TTL 缓存。
-5. **无监听机制**（对象存储没有 watch），Tracker **应当**轮询或按请求刷新桶对象。Punch 不直接访问桶，也不轮询 Tracker；它的信任与撤销配置由基础设施管理面下发（5.5 与 7.5 节）。
+5. **无监听机制**（对象存储没有 watch），Tracker **应当**轮询或按请求刷新桶对象。Punch 不直接访问桶或 Tracker；它只验证控制集群静态配置的 admission authority 公钥（5.5 与 7.5 节）。
 
 ### 3.4 成本与容量约束
 
@@ -189,7 +189,7 @@ files/<hh>/<info_hash>.hashes                叶子哈希列表（proof_list 目
 
 1. **资源声明的 TTL 不得过短**。既有设计的 `ttl: 1800`（30 分钟）在桶模型下会产生显著写放大（1 万 peer 即 33 次写/秒，约 $430/月 的 PUT 费用）。本文建议 TTL **不低于 3 小时**，因为"是否在线"本就由 Punch 的 Binding 决定——**资源索引只表达"声明持有"，不表达"在线"**，失效的候选在 `signal` 阶段会被自然过滤掉。
 2. **Tracker 侧缓存索引 LIST 结果**（30–60 s），把 LIST 放大压到常数级。
-3. **Tracker 缓存吊销列表与描述符**，把高频读取压到常数级；Punch 的拓扑、信任与撤销配置由基础设施管理面维护，不直接读取桶或 Tracker（5.5 与 7.5 节）。
+3. **Tracker 缓存吊销列表与描述符**，把高频读取压到常数级；Punch 的拓扑与 admission authority 由基础设施配置维护，不直接读取桶或 Tracker（5.5 与 7.5 节）。
 
 若网络规模大到这些约束不够用，应当引入一层缓存服务（Redis / 内存索引），但那属于优化；本文要求的是**默认配置下不触发**。
 
@@ -202,7 +202,7 @@ files/<hh>/<info_hash>.hashes                叶子哈希列表（proof_list 目
 | 网络创建者 | 读写全部 | 整个桶 |
 | Tracker | **读写** | `net/peers/*`、`net/resources/*`、`net/revocations/*` |
 | Tracker | **不得** | `net/descriptor.json`、`net/trackers.json` |
-| Punch | **无桶凭据** | 不直接访问桶或 Tracker；只消费管理面下发的通用 trust bundle |
+| Punch | **无桶凭据** | 不直接访问桶或 Tracker；只验证控制集群配置的 admission authority 公钥 |
 | 客户端 | 只读（公开桶或预签名 URL） | `files/*` |
 
 Tracker 不能改写"谁有权签发"这件事，是 2.2 节"Tracker 作恶破坏半径变小"的技术保证。授予与撤销的具体机制见 3.6 节。
@@ -222,7 +222,7 @@ Tracker **本来就已经持有该网络的签名密钥**（4.3 节的 `kid` 私
 | 主体 | 凭据 | 理由 |
 | --- | --- | --- |
 | Tracker | 桶级读写（一网络一桶） | 它已持有签名密钥，桶级写不扩大权限；一网络一桶保证**跨网络隔离** |
-| Punch | **无桶凭据** | 它不持有签名密钥、部署在边缘，是需要严格限制的那个；信任与吊销状态统一经管理面 trust bundle 获取 |
+| Punch | **无桶凭据** | 它不持有网络签名密钥、部署在边缘，是需要严格限制的那个；只配置控制集群的 admission authority 公钥 |
 
 跨网络隔离才是这里真正要保的东西——一个 Tracker 进程同时服务多个网络，若共用桶则一份凭据可触及所有网络的数据；一网络一桶让这件事天然不成立。
 
@@ -259,7 +259,7 @@ S3 上的具体做法（跨账号角色 + `ExternalId`）如下，其他存储�
 
 Deny 优先，因此在 S3 上"Tracker 改不了谁有权签发"是**云厂商强制的**。但按上面的论证，这条约束属于纵深防御而非必需项：R2 等不支持前缀级授权的存储上可以不做，改由 3.6.4 节的创建者签名承担。
 
-**Punch 不得持有任何桶凭据，也不得与 Tracker 维持业务同步关系**：它只消费基础设施管理面下发的通用 trust bundle（5.5 与 7.5 节）。这样一台边缘 Punch 失守不会获得任何网络的对象读取面，也不会因服务多个网络而持有多份桶凭据或 Tracker 地址。
+**Punch 不得持有任何桶凭据，也不得与 Tracker 维持业务同步关系**：它只配置控制集群的 admission authority 公钥（5.5 与 7.5 节）。这样一台边缘 Punch 失守不会获得任何网络的对象读取面，也不会因服务多个网络而持有多份桶凭据、Tracker 地址或网络级策略。
 
 运行时：Tracker 按 `network_id` 调 AssumeRole 换取临时凭据，缓存在内存并自动刷新，**不得**落盘或写进配置文件。一个进程服务多个网络时持有多份凭据，按 `network_id` 索引。
 
@@ -333,7 +333,7 @@ Deny 优先，因此在 S3 上"Tracker 改不了谁有权签发"是**云厂商�
 }
 ```
 
-每个被授权的 Tracker（可以是不同运营方）在集合里占一条 `kid`。对端 Peer 按 `kid` 取公钥；Punch 使用基础设施管理面从该集合派生并下发的 issuer trust bundle（5.5 / 7.5 节），不自行读取网络桶。密钥轮换即追加新 `kid` 并把旧的标为 `retired`；撤销一个 Tracker 即从集合移除并标 `revoked`。
+每个被授权的 Tracker（可以是不同运营方）在集合里占一条 `kid`。对端 Peer 按 `kid` 取公钥；同一控制集群的 Punch 只配置该集群 Tracker 使用的 admission authority 公钥（5.5 / 7.5 节），不自行读取网络桶。密钥轮换即追加新 `kid` 并把旧的标为 `retired`；撤销一个 Tracker 即从集合移除并标 `revoked`。
 
 ### 4.4 无状态 login nonce
 
@@ -355,13 +355,13 @@ challenge = JWT { iss: network_id, kid, sub: peer_id,
 | JWT 用途 | `aud` | `scope` | 新增 / 变化的 claims | 有效期 |
 | --- | --- | --- | --- | --- |
 | Tracker 会话 | `tracker` | `query`、`announce` | `iss` = `network_id` | 分钟–小时级 |
-| Punch Binding | `punch_id` | `punch` | `iss` = `network_id`；一次性 `jti` | 10–30 分钟 |
+| Punch Binding | `punch_id` | `punch` | `iss` = `network_id`；一次性 `jti`；`authorized_until` | **5 分钟** |
 | 连接目标 Peer | `punch_b_id` | `connect` | `iss` = `network_id`；`connection_id`（= `jti`）、`grace_until` | `CONNECT_JWT_EXP`（60 s） |
 | TURN 中继 | `turn_region_id` | `relay` | `iss` = `network_id`；配额 | 分钟级 |
 
-`iss` 从"Tracker 身份"改为 **`network_id`**，签发者由 `kid` 区分。这样票据自解释"属于哪个网络、由哪把被授权的钥匙签发"，验签方从对应网络的桶取 JWKS 即可——**这正是多个独立 Tracker 能为同一网络服务的前提**。
+`iss` 从"Tracker 身份"改为 **`network_id`**，签发者由 `kid` 区分。Peer 从对应网络的桶取 JWKS 验证 Tracker 票据；Punch 则只验证其所属控制集群配置的 **admission authority** 公钥（见 5.5 节），不读取网络 JWKS。
 
-其余校验规则沿用既有设计 §6（含所有票据**必须**校验 `iat > revoked_at`）。
+撤销后的收敛不再依赖 Punch 维护每网络撤销表：Tracker 拒绝后续 login / query / announce 并停止签发新票据；`connect` ticket 最长 60 s，`punch` ticket 与 Binding 授权最长 5 分钟。这样以一个清晰、可配置的短票据窗口换取 Punch 的业务无关性。
 
 ## 5. 控制面
 
@@ -424,9 +424,27 @@ punch.healthz({ request_id })
 
 自建与 PaaS 使用完全相同的探测协议：前者由维护者给 Tracker 配置可用 Punch，后者由 PaaS 管理面下发相同配置（7.5 节）。
 
+#### Punch runtime 配置边界
+
+Punch 的启动配置只允许包含基础设施级信息：
+
+```text
+identity_key_ref
+listen_addresses
+admission_authority_public_keys
+max_bindings
+max_pending_signals
+max_bindings_per_peer
+max_pending_per_ip
+```
+
+`punch_id` **应当**由 identity public key 派生，而非人工填写，避免 `aud` 与密钥身份错配。配置中**不得**出现 `network_id`、Tracker URL、桶 URI / 凭据、资源索引、撤销游标、网络级 issuer 或 PaaS 套餐信息。authority 公钥轮换是普通部署配置更新：短暂保留新旧公钥并行即可，不需要每网络 bundle。
+
+初始 authority 配置无效、监听未就绪、实例排水或全局 admission 已满时，`punch.healthz.ready` 为 false，且 Punch 拒绝新 `join` / `offer`；已有 Binding 与 DataChannel 不受影响。
+
 ### 5.4 Punch 信令
 
-沿用既有设计 §3.5 / §7.2.2：`punch.join` / `punch.heartbeat` / `punch.exit` / `punch.signal`，语义、信道模型（`binding_key`、`signal_key`、常驻 / 瞬时信道的区分）全部不变。
+沿用既有设计 §3.5 / §7.2.2：`punch.join` / `punch.heartbeat` / `punch.exit` / `punch.signal`，信道模型（`binding_key`、`signal_key`、常驻 / 瞬时信道的区分）不变。唯一的租约变化见 5.5 节：heartbeat 只能维持 NAT 映射，不能超过 `authorized_until` 延长 Binding；续租必须携带新 `punch` ticket 重新 join。
 
 Punch 只做两类通用判断：
 
@@ -435,70 +453,39 @@ Punch 只做两类通用判断：
 
 它不解析网络对应哪个 Tracker 或桶，也不主动拉取任何网络状态。
 
-### 5.5 通用 trust bundle 与撤销
+### 5.5 Admission authority 与有界撤销
 
-既有设计的网络级撤销记录仍以创建者桶的 `net/revocations/*` 为权威来源，Tracker 负责读写它；但 Punch 不直接读桶，也不向 Tracker 拉快照。
-
-基础设施管理面将各网络的授权 Tracker 公钥、撤销时间戳与可选配额编译为**通用 trust bundle**，以配置热更新、控制通道推送或本地文件替换的形式下发给 Punch：
+Punch 不维护网络级 issuer、撤销或配额表，也不消费 `trust_bundle`。每个 **Tracker + Punch 控制集群**配置一把 admission authority：Tracker 持私钥签发 `punch` / `connect` capability，Punch 仅配置对应公钥验签。
 
 ```text
-trust_bundle = {
-  generation: <u64>,
-  issuers: [{ network_id, kid, public_key }],
-  revoked: [{ network_id, key_fingerprint, revoked_at }],
-  quotas: [{ network_id, max_bindings? }]
-}
+控制集群 C:
+  Tracker_C: admission_authority_private_key = K_C.private
+  Punch_C:   admission_authority_public_keys = [K_C.public, K_C_previous.public]
 ```
 
-Punch 对 bundle 只执行通用能力验证：按 `(network_id, kid)` 找验签键，检查 `aud == punch_id`、`iat > revoked_at` 与可选 `max_bindings`。它不关心这些条目来自哪个 Tracker、哪个桶或哪项业务。
+Punch 对 capability 只做通用检查：签名来自本集群 authority、`aud == punch_id`、`scope` / `nbf` / `exp` 有效、`jti` 未消费、以及本机全局 admission 未满。`iss=network_id` 可以作为不透明 namespace key 隔离 Binding 和连接记录，但 Punch 不用它查找任何网络配置。
 
-#### PaaS Punch 的服务授权交集
+这同时解决 PaaS Punch 的未授权使用：PaaS Punch 只信任 PaaS 控制集群的 `K_paas`；任意外部 Tracker 即使被网络创建者写入 `net/trackers.json`，也没有 `K_paas.private`，签不出该 Punch 接受的 capability。PaaS 在为一个网络提供 Tracker 服务前，必须验证该网络桶已将 `K_paas.public` 授权进 `net/trackers.json`；套餐、区域与网络配额由 PaaS Tracker 的**签发逻辑**控制，而非下发给 Punch 的逐网络策略。
 
-**网络授权 Tracker 不等于有权使用 PaaS Punch。** `net/trackers.json` 只表达"谁可以为该网络签发协议票据"；PaaS Punch 是平台的付费基础设施，必须再经过平台产品授权。否则创建者只要把任意 Tracker 公钥加入桶，就能绕过套餐使用公共 Punch 池。
+自建完全同构：维护者配置 `K_self.private` 给自己的 Tracker、`K_self.public` 给自己的 Punch。自建 Tracker 不能直接使用 PaaS Punch，反之亦然；要迁移则迁移整个控制集群，网络桶、`network_id`、peer 身份和种子文件不变。
 
-PaaS 控制面为每个已开通 Punch 的网络维护协议外的 entitlement：
+#### 有界撤销
 
-```text
-punch_entitlement = {
-  network_id,
-  allowed_tracker_kids: [kid...],
-  allowed_punch_pools: [pool_id...],
-  max_bindings,
-  expires_at
-}
-```
+网络级撤销记录仍以创建者桶的 `net/revocations/*` 为权威来源，Tracker 负责读写和拒绝后续请求。Punch 不读取它，撤销收敛由短票据保证：
 
-对某个 PaaS Punch 实例，管理面只把以下**交集**编译进 bundle：
+- `connect` ticket 最长 60 s，Tracker 停签后，新的信令连接最多在 60 s 内收敛；
+- `punch` ticket 最长 5 分钟，Binding 的 `authorized_until` **不得**超过该 ticket 的 `exp`；heartbeat 只能维持 NAT 映射，**不得**把 Binding 延长超过 `authorized_until`；
+- Peer 希望续租 Binding 时，必须重新执行 `punch.join` 并携带 Tracker 新签发的 `punch` ticket。被撤销者无法取得新票，最迟 5 分钟失去 Binding；
+- 已建立的 DataChannel 不被 Punch 主动中断，直到任一端断开。
 
-```text
-effective_issuers(punch) = {
-  key ∈ active_keys(network bucket / net/trackers.json)
-  | key.kid ∈ entitlement.allowed_tracker_kids
-  && punch.pool_id ∈ entitlement.allowed_punch_pools
-}
-```
-
-因此 Punch 本地接受一个 `punch` 或 `connect` capability 的完整条件是：
-
-```text
-(iss = network_id, kid) ∈ effective_issuers(punch)
-&& aud == punch.punch_id
-&& scope / nbf / exp / iat / revoked_at / quota 均有效
-```
-
-未知 Tracker 的 `kid` 不在 bundle，会在验签前被拒绝；即使某 Tracker 已被网络创建者授权，只要它不在该网络的 PaaS entitlement 交集里，也无法消耗 PaaS Punch 资源。`aud` 进一步阻止一张票据被拿到另一台 Punch 使用。
-
-- **PaaS**：控制面从网络桶同步 `trackers.json` / `revocations/*`，与 entitlement 求交后生成并推送 bundle；同时维护 Punch fleet 的拓扑、健康与共享容量。
-- **自建**：维护者直接用同一 bundle 格式配置允许的 issuer、撤销和配额；没有 PaaS entitlement 服务，也就没有第二道产品授权，但最终下发给 Punch 的 schema 与验证逻辑不变。
-- bundle 的最大陈旧度超过 `TRUST_BUNDLE_MAX_STALE`（建议 3600 s）时，Punch **必须** fail-closed：拒绝新的 `join` 与 `offer`，但不得中断已建立的 Binding 或 DataChannel。
-- "revoke 时通知 Punch 清除 Binding"不是网络协议的一部分：控制面是否主动推送是实现优化，正确性只依赖于 bundle 的陈旧度上限。
+这是刻意选择：以 **≤60 s 的新连接窗口、≤5 分钟的 Binding 窗口**替代 per-network trust bundle 的分发和陈旧性协议，保持 Punch 完全业务无关。
 
 ### 5.6 残留窗口
 
 revoke 之后，被吊销者的残留能力（沿用既有 #19 的分析，并补充网络范围）：
 
 1. 无法 `login`（注册记录已删）⇒ 拿不到 punch JWT、session JWT、connect JWT；
-2. 已存在的 Binding 在 TTL（10–30 分钟）内仍可被找到，但**无法接受新连接**——`signal(offer)` 按本地 trust bundle 校验 `iat > revoked_at`，而他拿不到新的 connect JWT；
+2. 已存在的 Binding 最多保留 5 分钟（`authorized_until`），且 Peer 无法再取得新的 `connect` ticket；因此新的信令连接最多在 60 秒内收敛，Binding 最多在 5 分钟内自然失效；
 3. 已建立的 DataChannel 继续传输，直到任一端断开；
 4. 残留窗口**仅限该网络**，其他网络不受影响。
 
@@ -531,9 +518,9 @@ revoke 之后，被吊销者的残留能力（沿用既有 #19 的分析，并�
 
 ### 7.2 L2：多运营方联邦
 
-因为授权公钥集合在桶里（`net/trackers.json`），**不同运营方可以为同一个网络签发票据**：创建者把他们的公钥加进集合即可。客户端按 `kid` 验签；基础设施管理面把同一集合编译进 Punch 的 trust bundle，不需要网络协议层的中心化协调。
+因为授权公钥集合在桶里（`net/trackers.json`），网络可以配置多个同一控制集群的 Tracker 实例做负载均衡与容灾：它们共享 admission authority，客户端按 `kid` 验签，任一实例都能返回同一个 Punch pool 的 capability。
 
-这带来了健康的竞争与容灾：一个 Tracker 服务商下线，创建者把它从集合移除，网络照常运转。
+不同运营方的 Tracker 也可以被创建者写入网络 JWKS，但在 v1 中它们是**独立控制集群**：各自只能为自己的 Punch pool 签 capability，不能直接复用对方 Punch。跨控制集群的 Peer discovery / capability delegation 留作后续联邦协议，不在本文定义。
 
 ### 7.3 唯一在多实例下变弱的环节：限流
 
@@ -553,32 +540,29 @@ TURN 是唯一不落在创建者桶上的基础设施成本，也是唯一真正
 
 ### 7.5 基础设施管理面
 
-网络桶保存的是身份、资源、吊销等**网络业务状态**；Tracker / Punch / TURN 的拓扑、健康、容量、配额与 trust bundle 属于**基础设施状态**，不得写进网络桶。
+网络桶保存的是身份、资源、吊销等**网络业务状态**；Tracker / Punch / TURN 的拓扑、健康、容量与 admission authority 属于**基础设施状态**，不得写进网络桶。
 
-管理面向 Tracker 下发候选 Punch 配置：
+一个控制集群的基础设施配置只包含通用内容：
 
 ```text
-punches: [{
-  punch_id,
-  endpoint,
-  expected_public_key,
-  region,
-  weight
-}]
+control_cluster = {
+  admission_authority_key_ref,       # Tracker 持私钥；Punch 持对应公钥
+  punches: [{ punch_id, endpoint, expected_public_key, region, weight }],
+  turn_servers: [...],
+  global_capacity: { max_bindings, max_pending_signals }
+}
 ```
 
-Tracker 通过 `punch.healthz` 主动探测这些候选，基于健康、区域与权重选择 Punch；它不接收 Punch 注册，也不把 Punch 的在线状态回写网络桶。
+Tracker 通过 `punch.healthz` 主动探测候选 Punch，基于健康、区域与权重选择 Punch；它不接收 Punch 注册，也不把 Punch 的在线状态回写网络桶。Punch 只配置本控制集群的 admission authority 公钥，故外部 Tracker 无法签出它接受的票据。
 
-管理面向 Punch 下发第 5.5 节的 trust bundle 与可选网络配额。Punch 共享全局容量；管理面**可以**为每个 `network_id` 分配 `max_bindings`，避免一个网络耗尽公共 Punch 池。Tracker 的选择只是预筛，Punch 在 `join` 时是容量的最终裁决者。
-
-对 PaaS，管理面还必须维护网络的 Punch entitlement，并只将"网络 JWKS ∩ entitlement ∩ 当前 Punch pool"编译进 bundle。**不得**把桶中全部 Tracker key 无条件下发给公共 Punch 池；否则网络级授权会意外升级为平台基础设施使用权。
+PaaS 是否为一个网络启用 Punch、使用哪些区域和套餐，由 PaaS Tracker 在**签发 capability 前**检查；自建则由维护者的 Tracker 配置决定。两边都不会向 Punch 下发网络级策略、`trust_bundle` 或 entitlement。
 
 PaaS 与 self-hosted 运行完全相同的 Tracker / Punch 二进制与配置 schema：
 
-| 形态 | 管理面配置来源 |
+| 形态 | 基础设施配置来源 |
 | --- | --- |
-| Self-hosted | 维护者的本地配置、配置仓库或 `punchctl apply` |
-| PaaS | 运营方控制面（服务发现、调度、KMS、配额与观测） |
+| Self-hosted | 维护者的本地配置或配置仓库 |
+| PaaS | 运营方控制面（服务发现、调度、KMS、套餐与观测） |
 
 差异只在配置的**来源与运维责任**，不得进入网络协议、种子文件、桶格式或 Peer SDK。
 
@@ -655,16 +639,15 @@ SDK 侧按比例分流：**对照组不启用 P2P，实验组启用**。两组�
 
 ### 9.2 混合部署矩阵
 
-协议的授权结构天然支持按组件拆分，不必全有或全无：
+P2P 控制服务的最小可迁移单元是 **Tracker + Punch 控制集群**，不是两者任意拼装：Tracker 用集群 admission authority 签票，Punch 只信任同一 authority。这样避免将网络级策略同步进 Punch。
 
-| 组件 | 协议支持 | 可选项 |
+| 单元 | 协议支持 | 可选项 |
 | --- | --- | --- |
-| Tracker | `net/trackers.json` 是多签发者集合 | PaaS 托管 / 创建者自建 / 第三方，**可以并存**（互为灾备） |
-| Punch | 管理面候选配置 + `punch.healthz` 主动探测 | PaaS 公共池 / 创建者自建（例如他在目标用户地区有机房） |
+| 控制集群（Tracker + Punch） | 共享 admission authority；Tracker 主动 `punch.healthz` 探测集群 Punch | PaaS 托管 / 创建者自建 / 第三方；切换时迁移整个集群 |
 | TURN | `net/descriptor.json` 的 `turn_servers` | PaaS 全球池（默认）/ 创建者自带 / 混合 |
 | 桶 | `network_id` 即桶 URI | 永远是创建者自己的 |
 
-因此计费应当**按组件拆开**：只用 TURN 就只付 TURN。7.4 节列出的三种 TURN 归属在此收敛为"PaaS 提供是默认值，自建是可选覆盖"。
+因此计费以控制集群与 TURN 为单位；只用 TURN 就只付 TURN。7.4 节列出的三种 TURN 归属在此收敛为"PaaS 提供是默认值，自建是可选覆盖"。
 
 ### 9.3 计费边界：我们能计量什么
 
@@ -733,9 +716,9 @@ SDK 侧按比例分流：**对照组不启用 P2P，实验组启用**。两组�
 | --- | --- | --- |
 | 创建者作恶 | 审查、驱逐、窥视**本网络**元数据 | 这是他的网络，属于设计内权力；跨网络身份不受影响，用户可迁移到别的网络 |
 | 桶被攻破 / 误删 | 该网络元数据不可用 | 版本控制 + 对象锁；客户端需要明确的"网络不可用"降级 |
-| Tracker 被攻破 | 可签发任意票据、可写授权给它的对象 | 最小权限（3.5 / 3.6 节）：改不了 `descriptor.json` / `trackers.json`；创建者删除角色即撤销，延迟 ≤ session duration |
+| Tracker / admission authority 被攻破 | 可在控制集群内签发任意 Punch capability、可写授权给它的对象 | admission key 放 KMS；短票据窗口（connect 60 s / Binding 5 min）；创建者删除角色并迁移控制集群即可撤销 |
 | Punch 被攻破 | 信令 DoS、 Binding 伪造（无法窃听数据） | **无桶凭据**；`aud` 绑定使票据不可跨 Punch 使用 |
-| 未授权 Tracker 使用 PaaS Punch | 白嫖公共 Punch 池或挤占容量 | trust bundle 只含「网络 JWKS ∩ PaaS entitlement ∩ Punch pool」的 issuer；本机再验 `aud=punch_id` 与配额 |
+| 未授权 Tracker 使用 PaaS Punch | 白嫖公共 Punch 池或挤占容量 | PaaS Punch 只信任 PaaS 控制集群 admission authority；外部 Tracker 无法签出被接受的 capability；本机再验 `aud=punch_id` 与全局 admission |
 | 恶意 Peer 投递损坏数据 | 浪费带宽 | Merkle 校验 + 失败计数（沿用既有设计） |
 | 伪造 `leaf_hashes` / `proof_list` | 试图污染数据 | 本地重建 root 与 `info.root` 比对，不符则拒绝 |
 | 批量注册撑爆注册表 | 存储膨胀 | 沿用既有 #16 的建议：PoW / 邀请码 / 限流 |
@@ -753,10 +736,10 @@ SDK 侧按比例分流：**对照组不启用 P2P，实验组启用**。两组�
 | 4 | 引入 `net/trackers.json`（JWKS），`kid` 承载签发者身份 | 协议 |
 | 5 | 吊销范围从全局改为网络级 | 语义 |
 | 6 | login nonce 改为自包含挑战，Tracker 零持久状态 | 协议 |
-| 7 | Punch 不读桶、不注册网络、不向 Tracker 拉业务状态；控制面下发通用 trust bundle | 架构 |
-| 8 | 删除"revoke 通知 Punch 清 Binding"这条 MAY | 简化 |
+| 7 | Punch 不读桶、不注册网络、不向 Tracker 拉业务状态；只信任控制集群 admission authority | 架构 |
+| 8 | 删除"revoke 通知 Punch 清 Binding"这条 MAY；以 60 s connect / 5 min binding 短票据窗口收敛 | 简化 |
 | 9 | 新增通用 Punch RPC `punch.healthz`，Tracker 主动探测候选 Punch | 新增 |
-| 10 | Punch / TURN 拓扑、健康与配额从网络桶迁至基础设施管理面；PaaS 以 entitlement 把网络授权与平台服务授权取交集 | 架构 |
+| 10 | Punch / TURN 拓扑、健康与容量从网络桶迁至基础设施配置；Tracker + Punch 组成不可拆的控制集群 | 架构 |
 | 11 | announce TTL 建议从 30 分钟放宽到 ≥ 3 小时（在线性由 Punch 承担） | 参数 |
 | 12 | 计量基准改为桶出向流量 + A/B 对照，遥测降级为归因 | 产品 |
 | 13 | 数据面（Merkle / chunk / 调度 / TURN 回退） | **不变** |
