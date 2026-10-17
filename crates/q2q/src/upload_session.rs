@@ -5,12 +5,12 @@ use crate::peer::PeerSession;
 use crate::peer_transfer::{BLOCK_DEADLINE, IDLE, decode_bitfield, protocol, receive, send};
 use crate::source_file::PreparedFile;
 use crate::task_scope::{TaskGuard, TaskScope};
+use crate::upload_cache::{FlightState, Lookup, SourceCache, VerifiedBlock};
 use crate::upload_progress::Connection;
 use crate::upload_source::UploadSource;
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use bytes::BytesMut;
 use q2q_core::block::PIECE_SIZE;
-use q2q_core::merkle::Proof;
 use q2q_core::peer_wire::{Control, Piece};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -19,6 +19,7 @@ use webrtc::data_channel::{DataChannel, DataChannelEvent};
 
 pub(crate) struct UploadContext {
   scope: TaskScope,
+  cache: Option<Arc<SourceCache>>,
   permit: Option<Arc<OwnedSemaphorePermit>>,
   rate: Option<Arc<crate::upload_rate::UploadRate>>,
   progress: Option<Arc<Connection>>,
@@ -32,6 +33,7 @@ impl UploadContext {
   ) -> Self {
     Self {
       scope,
+      cache: None,
       permit: Some(permit),
       rate,
       progress,
@@ -40,29 +42,128 @@ impl UploadContext {
   pub(crate) fn unmanaged() -> Self {
     Self {
       scope: TaskScope::new(),
+      cache: None,
       permit: None,
       rate: None,
       progress: None,
     }
   }
-  async fn read_block(
+  pub(crate) fn cached(mut self, cache: Option<Arc<SourceCache>>) -> Self {
+    self.cache = cache;
+    self
+  }
+
+  pub(crate) async fn read_block(
     &self,
     source: Arc<dyn UploadSource>,
     index: usize,
-  ) -> Result<(Vec<u8>, Proof), TransferError> {
-    // Acquire before spawning: queued readers remain abortable async tasks,
-    // rather than occupying Tokio blocking threads or retaining read slots.
-    let read = source
-      .read_limit()
-      .acquire_owned()
-      .await
-      .expect("source read gate is never closed");
-    let task = self.read_task(read);
-    tokio::task::spawn_blocking(move || {
-      let _task = task;
-      source.read_block(index)
-    })
-    .await?
+  ) -> Result<Arc<VerifiedBlock>, TransferError> {
+    let result = self.read_cached(source, index).await;
+    if result.is_err()
+      && let Some(cache) = &self.cache
+    {
+      cache.close();
+    }
+    result
+  }
+
+  async fn read_cached(
+    &self,
+    source: Arc<dyn UploadSource>,
+    index: usize,
+  ) -> Result<Arc<VerifiedBlock>, TransferError> {
+    let Some(cache) = &self.cache else {
+      let read = source
+        .read_limit()
+        .acquire_owned()
+        .await
+        .expect("source read gate is never closed");
+      let task = self.read_task(read);
+      return tokio::task::spawn_blocking(move || {
+        let _task = task;
+        let (bytes, proof) = source.read_block(index)?;
+        Ok(VerifiedBlock::new(bytes, proof, None))
+      })
+      .await?;
+    };
+    loop {
+      let block = match cache.lookup(index) {
+        Lookup::Closed => return Err(TransferError::Closed),
+        Lookup::Hit(block) => block,
+        Lookup::Wait(mut flight) => {
+          let ready = loop {
+            let state = flight.borrow_and_update().clone();
+            match state {
+              FlightState::Ready(block) => break Some(block),
+              FlightState::Closed => return Err(TransferError::Closed),
+              FlightState::Retry => break None,
+              FlightState::Loading => {
+                if flight.changed().await.is_err() {
+                  break None;
+                }
+              }
+            }
+          };
+          match ready {
+            Some(block) => block,
+            None => continue,
+          }
+        }
+        Lookup::Load(flight) => {
+          // Before spawn, dropping the future drops FlightGuard and lets a
+          // waiter retry. After spawn, the closure owns it and publishes even
+          // if the originating connection is cancelled. Its read/connection
+          // permits and scope guard remain alive until the blocking job ends.
+          let read = source
+            .read_limit()
+            .acquire_owned()
+            .await
+            .expect("source read gate is never closed");
+          let task = self.read_task(read);
+          let source = source.clone();
+          let block = tokio::task::spawn_blocking(move || {
+            let _task = task;
+            let before = source.revision(index)?;
+            let (bytes, proof) = source.read_block(index)?;
+            let after = source.revision(index)?;
+            let retain = before == after;
+            let block = VerifiedBlock::new(bytes, proof, Some(before));
+            flight.complete(block.clone(), retain);
+            Ok::<_, TransferError>(block)
+          })
+          .await??;
+          if cache.is_closed() {
+            return Err(TransferError::Closed);
+          }
+          return Ok(block);
+        }
+      };
+      if block.revision.is_none() {
+        cache.invalidate(index, &block);
+        continue;
+      }
+      // Hits still check availability and opened-file metadata, under the same
+      // bounded blocking-job budget. They do not rehash immutable cached bytes.
+      let read = source
+        .read_limit()
+        .acquire_owned()
+        .await
+        .expect("source read gate is never closed");
+      let task = self.read_task(read);
+      let source = source.clone();
+      let revision = tokio::task::spawn_blocking(move || {
+        let _task = task;
+        source.revision(index)
+      })
+      .await??;
+      if cache.is_closed() {
+        return Err(TransferError::Closed);
+      }
+      if block.revision.as_ref() == Some(&revision) {
+        return Ok(block);
+      }
+      cache.invalidate(index, &block);
+    }
   }
 
   pub(crate) fn read_task(&self, read: OwnedSemaphorePermit) -> UploadReadTask {
@@ -179,7 +280,7 @@ impl PeerSession {
       .await
       .map_err(|_| TransferError::Timeout)??;
     decode_bitfield(message, seed.info.leaf_count())?;
-    let mut pending: Option<(usize, Vec<u8>, Proof)> = None;
+    let mut pending: Option<(usize, Arc<VerifiedBlock>)> = None;
     loop {
       let control = tokio::select! {
         changed = availability.changed(), if changing => {
@@ -223,13 +324,14 @@ impl PeerSession {
           if let Some(progress) = &context.progress {
             progress.state(crate::upload_progress::UploadConnectionState::Sending);
           }
-          let (bytes, proof) = context.read_block(source.clone(), index).await?;
+          let block = context.read_block(source.clone(), index).await?;
+          let bytes = &block.bytes;
           send(
             &*self.control,
             Control::Proof {
               block_index,
               count: 1,
-              proof: proof.clone(),
+              proof: block.proof.clone(),
             },
           )
           .await?;
@@ -237,24 +339,25 @@ impl PeerSession {
             &*self.data,
             Some((&*self.control, &context)),
             block_index,
-            &bytes,
+            bytes,
             &[(0, bytes.len() as u32)],
             false,
           )
           .await?;
-          pending = Some((index, bytes, proof));
+          pending = Some((index, block));
         }
         Control::PieceNack {
           block_index,
           piece_offset,
           length,
         } => {
-          let Some((index, bytes, _)) = &pending else {
+          let Some((index, block)) = &pending else {
             return Err(protocol("piece retry has no active block"));
           };
           if *index as u64 != block_index {
             return Err(protocol("piece retry names another block"));
           }
+          let bytes = &block.bytes;
           let ranges: Vec<_> = piece_offset.into_iter().zip(length).collect();
           let mut previous_end = 0;
           for &(offset, len) in &ranges {
@@ -283,7 +386,7 @@ impl PeerSession {
           block_index,
           count: 1,
         } => {
-          if let Some((index, _, proof)) = &pending {
+          if let Some((index, block)) = &pending {
             if *index as u64 != block_index {
               return Err(protocol("proof names another block"));
             }
@@ -292,7 +395,7 @@ impl PeerSession {
               Control::Proof {
                 block_index,
                 count: 1,
-                proof: proof.clone(),
+                proof: block.proof.clone(),
               },
             )
             .await?;
@@ -301,7 +404,7 @@ impl PeerSession {
         Control::BlockDone { block_index } => {
           if pending
             .as_ref()
-            .is_none_or(|(index, _, _)| *index as u64 != block_index)
+            .is_none_or(|(index, _)| *index as u64 != block_index)
           {
             return Err(protocol("unexpected block acknowledgement"));
           }

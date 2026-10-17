@@ -143,10 +143,10 @@ async fn queued_source_read_is_cancelable_without_spawning_or_reserving_capacity
     .unwrap();
   assert_eq!(reads.available_permits(), 0);
   drop(held);
-  let (bytes, _) = tokio::time::timeout(Duration::from_secs(1), context.read_block(prepared, 0))
+  let block = tokio::time::timeout(Duration::from_secs(1), context.read_block(prepared, 0))
     .await
     .unwrap()
     .unwrap();
-  assert_eq!(bytes, vec![3; 1024]);
+  assert_eq!(&*block.bytes, &vec![3; 1024]);
   assert_eq!(reads.available_permits(), 1);
 }

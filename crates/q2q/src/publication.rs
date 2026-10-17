@@ -31,6 +31,7 @@ impl Publication {
     wait_ready: bool,
     permits: Arc<Semaphore>,
     rate: Option<Arc<crate::upload_rate::UploadRate>>,
+    cache: Arc<crate::upload_cache::UploadCache>,
   ) -> Result<Self, TransferError> {
     // Claim before touching the shared Punch gate. A conflicting low-level
     // accept returns an error instead of being paused or stealing requests.
@@ -44,7 +45,7 @@ impl Publication {
     let runner = PublicationTask {
       hash: seed.info_hash(),
       source,
-      uploads: crate::upload::UploadPool::new(permits, rate, progress.clone()),
+      uploads: crate::upload::UploadPool::new(permits, rate, progress.clone()).with_cache(&cache),
       session,
       status: progress.run_guard(),
       progress: progress.clone(),

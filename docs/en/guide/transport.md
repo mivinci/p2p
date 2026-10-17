@@ -20,7 +20,9 @@ flowchart TB
     Session --> Rate["Shared rate budget<br/>upload_rate.rs"]
     Upload --> Stats["Upload progress<br/>upload_progress.rs"]
     Session --> Stats
-    Session --> Reads["max_upload_reads"]
+    Client --> Cache["Publication read coalescing / Client LRU<br/>upload_cache.rs"]
+    Session --> Cache
+    Cache --> Reads["max_upload_reads"]
     Reads --> Source["UploadSource<br/>upload_source.rs"]
     Source --> Prepared["PreparedFile / ProofTree<br/>source_file.rs"]
     Source --> Dest
@@ -140,11 +142,11 @@ let client = q2q::client::builder()
     .build().await?;
 ```
 
-Receivers can read different blocks concurrently, including arbitrary VOD seeks. Requests for the same block still read and verify independently; no block cache was added. Unix uses read_at and Windows uses seek_read with an absolute offset on every call. Windows may update the file cursor, but uploads never depend on that cursor. Other platforms retain a locked seek/read fallback.
+Receivers can read different blocks concurrently, including arbitrary VOD seeks. Managed uploads merge simultaneous reads of the same block and retain verified data/proofs in the bounded cache below. Unix uses read_at and Windows uses seek_read with an absolute offset on every call. Windows may update the file cursor, but uploads never depend on that cursor. Other platforms retain a locked seek/read fallback.
 
 `max_upload_reads` is independent of connection capacity and rate limits. Sources prepared by the same Client share the budget; PreparedFile clones share the original open file, metadata and proof tree. SDK uploads acquire capacity before spawn_blocking, so queued jobs remain cancelable. Started jobs retain capacity through reads, length/modification-time checks, leaf verification and proof generation. Network sends and acknowledgement waits hold no read slot. close/Drop still waits for in-flight reads to finish and release both read and connection capacity before shutdown completes.
 
-Every read checks the open file’s length and modification time before and after I/O and verifies the committed block leaf. Premature EOF caused by truncation is SourceChanged. Replacing the path does not replace the original open source. The synchronous `PreparedFile::read_verified_block(&self, index)` does not acquire the SDK async budget; callers creating their own threads manage concurrency themselves. The low-level serve_file parameter remains `Arc<Mutex<PreparedFile>>`; it briefly locks once to clone the immutable handle and performs no upload I/O under that lock.
+On complete-source cache misses and in the synchronous API, every disk read checks the open file’s length and modification time before and after I/O and verifies the committed block leaf. Premature EOF caused by truncation is SourceChanged. Replacing the path does not replace the original open source. The synchronous `PreparedFile::read_verified_block(&self, index)` does not acquire the SDK async budget; callers creating their own threads manage concurrency themselves. The low-level serve_file parameter remains `Arc<Mutex<PreparedFile>>`; it briefly locks once to clone the immutable handle and performs no upload I/O under that lock.
 
 This removes SDK cursor serialization, not physical disk or CPU contention. Throughput is not guaranteed to scale with receiver count.
 
@@ -164,6 +166,26 @@ sharing.close().await?;
 
 The first verified block is announced only after both its data and proof receipt are durable and the upload route exists. Track receives add=[hash] with an empty complete set. Later committed blocks produce Have messages on existing connections, with coalesced availability notifications. No per-block Track request is made. Once every block is committed and final file sync succeeds, an announcement upgrades the holding to complete. Heartbeats and holding renewal continue while sharing is active; closing or a source failure withdraws that hash.
 
-A download source uses an in-memory block-to-receipt-offset index, rebuilt only from revalidated receipts on resume. Upload reads seek directly to the bounded proof record and verify disk bytes and proof against the Seed root again. Uncommitted sparse bytes are unavailable. Destination reads and writes currently serialize under the destination lock; complete-source positional reads remain independent. Both source types share the Client's upload connection, disk-read and rate budgets. No block cache is added.
+A download source uses an in-memory block-to-receipt-offset index, rebuilt only from revalidated receipts on resume. Upload reads seek directly to the bounded proof record and verify disk bytes and proof against the Seed root again. Uncommitted sparse bytes are unavailable. Destination reads and writes currently serialize under the destination lock; complete-source positional reads remain independent. Both source types share the Client's upload connection, blocking-read and rate budgets, plus the bounded upload cache below.
 
 `PublicationState::Publishing` includes waiting for the first shareable block; `download_shared` returns before its first announcement. Use Track discovery when an external observer needs confirmation of visibility. A source or announcement failure produces Failed and is returned by close. Failed withdrawal can leave a stale Track entry until its holding TTL expires; the local upload route still closes.
+
+
+## Bounded upload block cache
+
+```rust
+let client = q2q::client::builder()
+    // ... Track, identity and storage settings ...
+    .upload_cache_bytes(16 * 1024 * 1024) // default 16 MiB, maximum 256 MiB
+    .build().await?;
+```
+
+All managed publications and download-sharing handles on one Client share this LRU budget. Entries are isolated by publication instance and block index; a later publication cannot reuse an earlier source's bytes. A retained entry accounts for data, proof vector capacities and basic entry/block structures. Hash-table allocation, in-flight reads, connection-owned send/retry blocks and DataChannel buffers are separate; this is not a process RSS cap. Active readers may keep an evicted Arc alive. No memory is reserved up front.
+
+Zero disables retention while still merging simultaneous reads. A block larger than the budget is shared with current waiters but not retained. Only successful verified reads can populate entries. Concurrent requests for one block share one immutable data/proof allocation; different blocks retain independent reads. BlockDone releases the connection's reference, while the LRU may keep the block for another receiver. Network pacing and retransmission accounting are unchanged. Caller-managed low-level serve_file uploads remain uncached; synchronous PreparedFile reads also retain their original behavior.
+
+Hits still run a bounded blocking availability/metadata check. Complete sources compare the original open file's length and modification time against preparation. Cache revisions also include Unix ctime; download sources include both data-file and proof-receipt-file metadata. A changed revision removes the requested old entry and causes a fresh verified read; older entries are invalidated lazily before use. Normal commits to a growing download may conservatively invalidate existing entries. Hits do not re-read or rehash immutable cached bytes. Platforms without Unix ctime cannot promise detection of changes that preserve the observed metadata; returned cached bytes/proofs remain the previously authenticated snapshot. The cache does not grant access to uncommitted blocks.
+
+A pending cache waiter consumes no read permit. Reads and hit checks acquire max_upload_reads before spawn_blocking. Cancelling the initiating request before spawning removes its flight so another waiter can retry. Once started, the blocking closure owns the flight, read permit, originating upload permit and task guard; it can publish the result for remaining waiters even after that connection is cancelled. Errors are not retained; the reading caller retains its typed error, and waiters can retry or observe closure. Closing a publication wakes waiters, clears only its entries and prevents late jobs from repopulating the cache. close still waits for its blocking jobs to release their permits. A failed source cannot keep serving old hits.
+
+`BuildError::InvalidUploadCacheBytes` is returned for a budget above 256 MiB; exhaustive matches must handle the new variant. Performance measurements and reproducible workloads are recorded in the repository's upload-block-cache todo; they measure verified source-read calls, not physical disk I/O or end-to-end network throughput.

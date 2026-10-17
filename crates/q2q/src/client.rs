@@ -33,6 +33,7 @@ pub struct Builder {
   peer_query_limit: Option<usize>,
   max_upload_peers: Option<usize>,
   max_upload_reads: Option<usize>,
+  upload_cache_bytes: Option<usize>,
   upload_rate_limit: Option<u64>,
 }
 
@@ -79,11 +80,19 @@ impl Builder {
     self
   }
 
-  /// Maximum in-flight source reads and hash checks, 1–16 (default 4).
+  /// Maximum in-flight source reads, metadata and hash checks, 1–16 (default 4).
   /// Shared by prepared sources and download sharing on this client. Independent
   /// of upload connections; waiting occurs before spawn_blocking.
   pub fn max_upload_reads(mut self, count: usize) -> Self {
     self.max_upload_reads = Some(count);
+    self
+  }
+
+  /// Retained upload data/proof cache budget across this Client (default
+  /// 16 MiB, maximum 256 MiB). Zero disables retention but still merges
+  /// simultaneous reads of the same block. In-flight/send buffers are separate.
+  pub fn upload_cache_bytes(mut self, bytes: usize) -> Self {
+    self.upload_cache_bytes = Some(bytes);
     self
   }
 
@@ -100,6 +109,12 @@ impl Builder {
   pub async fn build(self) -> Result<Client, BuildError> {
     if self.upload_rate_limit == Some(0) {
       return Err(BuildError::InvalidUploadRate);
+    }
+    let upload_cache_bytes = self
+      .upload_cache_bytes
+      .unwrap_or(crate::upload_cache::DEFAULT_CACHE_BYTES);
+    if upload_cache_bytes > crate::upload_cache::MAX_CACHE_BYTES {
+      return Err(BuildError::InvalidUploadCacheBytes);
     }
     let max_upload_reads = self.max_upload_reads.unwrap_or(4);
     if !(1..=16).contains(&max_upload_reads) {
@@ -145,6 +160,7 @@ impl Builder {
       peer_query_limit,
       uploads: Arc::new(Semaphore::new(max_upload_peers)),
       upload_reads: Arc::new(Semaphore::new(max_upload_reads)),
+      upload_cache: crate::upload_cache::UploadCache::new(upload_cache_bytes),
       upload_rate: self
         .upload_rate_limit
         .map(|rate| Arc::new(crate::upload_rate::UploadRate::new(rate))),
@@ -163,6 +179,7 @@ pub struct Client {
   peer_query_limit: usize,
   uploads: Arc<Semaphore>,
   upload_reads: Arc<Semaphore>,
+  upload_cache: Arc<crate::upload_cache::UploadCache>,
   upload_rate: Option<Arc<crate::upload_rate::UploadRate>>,
 }
 
@@ -212,6 +229,7 @@ impl Client {
       true,
       self.uploads.clone(),
       self.upload_rate.clone(),
+      self.upload_cache.clone(),
     )
     .await
   }
@@ -279,6 +297,7 @@ impl Client {
       false,
       self.uploads.clone(),
       self.upload_rate.clone(),
+      self.upload_cache.clone(),
     )
     .await
   }
@@ -346,6 +365,7 @@ pub enum BuildError {
   InvalidPeerQueryLimit,
   InvalidUploadPeers,
   InvalidUploadReads,
+  InvalidUploadCacheBytes,
   InvalidUploadRate,
   Storage(io::Error),
   Identity(crate::identity::IdentityError),
@@ -358,6 +378,7 @@ impl fmt::Display for BuildError {
       Self::Missing(field) => write!(f, "missing client setting: {field}"),
       Self::InvalidTrackUrl(e) => write!(f, "invalid Track URL: {e}"),
       Self::InvalidUploadRate => f.write_str("upload_rate_limit must be greater than zero"),
+      Self::InvalidUploadCacheBytes => f.write_str("upload_cache_bytes must be at most 256 MiB"),
       Self::InvalidUploadReads => f.write_str("max_upload_reads must be between 1 and 16"),
       Self::InvalidUploadPeers => f.write_str("max_upload_peers must be between 1 and 16"),
       Self::InvalidPeerQueryLimit => f.write_str("peer_query_limit must be between 1 and 50"),

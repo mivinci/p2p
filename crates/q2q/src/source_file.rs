@@ -160,13 +160,21 @@ impl PreparedFile {
   }
 
   fn check_unchanged(&self) -> Result<(), PrepareError> {
+    self.source_revision().map(|_| ())
+  }
+
+  pub(crate) fn source_revision(
+    &self,
+  ) -> Result<crate::upload_source::SourceRevision, PrepareError> {
     let metadata = self.file.metadata().map_err(PrepareError::Io)?;
     if metadata.len() != self.seed.info.length
       || matches!((self.modified, metadata.modified()), (Some(before), Ok(after)) if before != after)
     {
       return Err(PrepareError::SourceChanged);
     }
-    Ok(())
+    Ok(crate::upload_source::SourceRevision::from_metadata(
+      &metadata,
+    ))
   }
 
   #[cfg(any(unix, windows))]

@@ -189,6 +189,17 @@ impl crate::upload_source::UploadSource for DownloadSource {
   fn read_limit(&self) -> Arc<tokio::sync::Semaphore> {
     self.reads.clone()
   }
+  fn revision(&self, index: usize) -> Result<crate::upload_source::SourceRevision, TransferError> {
+    if !self.destination.available.borrow().has(index) {
+      return Err(TransferError::Closed);
+    }
+    self
+      .destination
+      .store
+      .lock()
+      .map_err(|_| TransferError::Checkpoint("destination lock poisoned".into()))?
+      .upload_revision(index)
+  }
   fn read_block(&self, index: usize) -> Result<(Vec<u8>, Proof), TransferError> {
     let result = self
       .destination

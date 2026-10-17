@@ -134,6 +134,19 @@ impl DownloadStore {
     }
     Ok(bytes)
   }
+  pub(crate) fn upload_revision(
+    &self,
+    index: usize,
+  ) -> Result<crate::upload_source::SourceRevision, TransferError> {
+    if self.failed || self.receipts.get(index).copied().flatten().is_none() {
+      return Err(invalid("block is unavailable for sharing"));
+    }
+    Ok(
+      crate::upload_source::SourceRevision::from_metadata(&self.destination.metadata()?)
+        .with_receipts(&self.journal.metadata()?),
+    )
+  }
+
   pub(crate) fn upload_block(
     &mut self,
     index: usize,

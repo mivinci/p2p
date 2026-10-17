@@ -9,7 +9,7 @@
 - [x] close/Drop 停止接入、取消并等待全部 worker，等待在途阻塞读取后释放发布及额度；继续复用共享心跳。
 - [x] 回归与真实联机：多个并发下载方、额度拒绝与释放、同时握手信令不串线、慢/坏节点隔离、取消清理、源文件变化、续租。
 
-后续阶段：热点缓存。并发按偏移读取见 [positional-source-reads.md](./positional-source-reads.md)。
+热点缓存方案与验证见 [upload-block-cache.md](./upload-block-cache.md)。并发按偏移读取见 [positional-source-reads.md](./positional-source-reads.md)。
 
 第二阶段总上传限速已接入，设计与验证见 [upload-rate-limit.md](./upload-rate-limit.md)。
 

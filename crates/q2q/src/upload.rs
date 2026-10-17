@@ -14,6 +14,7 @@ pub(crate) struct UploadPool {
   workers: JoinSet<Result<(), TransferError>>,
   permits: Arc<Semaphore>,
   scope: TaskScope,
+  cache: Option<Arc<crate::upload_cache::SourceCache>>,
   rate: Option<Arc<crate::upload_rate::UploadRate>>,
   progress: Arc<Progress>,
 }
@@ -29,8 +30,14 @@ impl UploadPool {
       rate,
       progress,
       scope: TaskScope::new(),
+      cache: None,
     }
   }
+  pub(crate) fn with_cache(mut self, cache: &Arc<crate::upload_cache::UploadCache>) -> Self {
+    self.cache = Some(cache.source());
+    self
+  }
+
   pub(crate) async fn run(
     &mut self,
     incoming: &mut tokio::sync::mpsc::Receiver<crate::peer::PendingPeer>,
@@ -54,7 +61,7 @@ impl UploadPool {
             Err(_) => { let _ = tokio::time::timeout(Duration::from_secs(2), request.reject(RejectReason::Busy)).await; continue; }
           };
           let progress = self.progress.connection(request.connection_id().to_owned(), request.peer_id().clone());
-          let context = UploadContext::managed(self.scope.clone(), permit, self.rate.clone(), Some(progress.clone()));
+          let context = UploadContext::managed(self.scope.clone(), permit, self.rate.clone(), Some(progress.clone())).cached(self.cache.clone());
           let source = source.clone();
           let task = self.scope.enter();
           self.workers.spawn(async move {
@@ -75,9 +82,20 @@ impl UploadPool {
     }
   }
   pub(crate) async fn stop(&mut self) {
+    if let Some(cache) = &self.cache {
+      cache.close();
+    }
     self.workers.abort_all();
     while self.workers.join_next().await.is_some() {}
     self.scope.idle().await;
+  }
+}
+
+impl Drop for UploadPool {
+  fn drop(&mut self) {
+    if let Some(cache) = &self.cache {
+      cache.close();
+    }
   }
 }
 

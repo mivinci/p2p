@@ -31,3 +31,6 @@
 - 读取/上传额度与阻塞任务清理测试连续 20 次通过。
 - Clippy（所有 targets/features、拒绝警告）、fmt、diff 检查、中英文文档构建和 transport 两页浏览器检查通过。
 - macOS 本地运行；Linux 由 PR CI 回归。Windows 仅提供标准库适配，本轮未运行 Windows 实机测试。没有引入块缓存或变更网络消息格式。
+
+
+后续托管上传在读取边界加入有界热点缓存和同块合并，见 [upload-block-cache.md](./upload-block-cache.md)；同步 PreparedFile 与低层上传的读取语义不变。

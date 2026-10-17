@@ -225,3 +225,36 @@ async fn peer_query_limit_defaults_to_spare_candidates_and_is_independent() {
     assert_eq!(client.max_download_peers, 4);
   }
 }
+
+#[tokio::test]
+async fn upload_cache_budget_is_client_wide_and_bounded() {
+  let dir = tempfile::tempdir().unwrap();
+  let make = || {
+    builder()
+      .track_url("http://127.0.0.1:1")
+      .identity_file(dir.path().join("identity"))
+      .storage_dir(dir.path().join("storage"))
+  };
+  for bytes in [256 * 1024 * 1024 + 1, usize::MAX] {
+    assert!(matches!(
+      make().upload_cache_bytes(bytes).build().await,
+      Err(BuildError::InvalidUploadCacheBytes)
+    ));
+  }
+  assert_eq!(
+    make().build().await.unwrap().upload_cache.capacity(),
+    16 * 1024 * 1024
+  );
+  for bytes in [0, 1, 256 * 1024 * 1024] {
+    assert_eq!(
+      make()
+        .upload_cache_bytes(bytes)
+        .build()
+        .await
+        .unwrap()
+        .upload_cache
+        .capacity(),
+      bytes
+    );
+  }
+}

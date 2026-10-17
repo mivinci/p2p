@@ -24,10 +24,52 @@ impl Availability {
   }
 }
 
+/// Revisions use opened files, never caller-controlled paths. Download sources
+/// include the receipt file so proof-only external changes also invalidate hits.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SourceRevision {
+  data: FileRevision,
+  receipts: Option<FileRevision>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FileRevision {
+  length: u64,
+  modified: Option<std::time::SystemTime>,
+  #[cfg(unix)]
+  changed: (i64, i64),
+}
+impl FileRevision {
+  fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+    Self {
+      length: metadata.len(),
+      modified: metadata.modified().ok(),
+      #[cfg(unix)]
+      changed: (metadata.ctime(), metadata.ctime_nsec()),
+    }
+  }
+}
+impl SourceRevision {
+  pub(crate) fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+    Self {
+      data: FileRevision::from_metadata(metadata),
+      receipts: None,
+    }
+  }
+  pub(crate) fn with_receipts(mut self, metadata: &std::fs::Metadata) -> Self {
+    self.receipts = Some(FileRevision::from_metadata(metadata));
+    self
+  }
+}
+
 pub(crate) trait UploadSource: Send + Sync {
   fn seed(&self) -> &Seed;
   fn availability(&self) -> watch::Receiver<Availability>;
   fn read_limit(&self) -> Arc<Semaphore>;
+  /// Blocking availability/metadata check. A revision change invalidates the
+  /// cached snapshot; only a fresh verified read may populate the new revision.
+  fn revision(&self, index: usize) -> Result<SourceRevision, TransferError>;
   /// Runs on a blocking thread with a read permit. Data and proof must refer
   /// to the same verified block; sparse or merely received bytes are excluded.
   fn read_block(&self, index: usize) -> Result<(Vec<u8>, Proof), TransferError>;
@@ -51,6 +93,12 @@ impl UploadSource for PreparedFile {
   }
   fn read_limit(&self) -> Arc<Semaphore> {
     self.read_limit()
+  }
+  fn revision(&self, index: usize) -> Result<SourceRevision, TransferError> {
+    if index >= self.block_count() {
+      return Err(crate::source_file::PrepareError::BlockOutOfRange(index).into());
+    }
+    Ok(self.source_revision()?)
   }
   fn read_block(&self, index: usize) -> Result<(Vec<u8>, Proof), TransferError> {
     Ok((self.read_verified_block(index)?, self.proof(index)?))

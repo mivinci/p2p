@@ -3,7 +3,7 @@
 All SDK test cases and fixtures live in this flat directory.
 
 - `sdk.rs`: Cargo integration target using only the public `q2q` API.
-- `client.rs`, `download_store.rs`, `transfer.rs`, `scheduler.rs`, `cdn.rs`, `reader.rs`, `online.rs`, `peer_identity.rs`, `punch_transport.rs`, `webrtc_transport.rs`, `signal_router.rs`, `upload.rs`, `upload_rate.rs`, `upload_progress.rs`, `upload_session.rs`, `admission.rs`, `source_file.rs`, `upload_source.rs`, `query.rs`: unit test modules loaded from their source modules through `#[cfg(test)]` and `#[path]`, preserving access to private implementation details.
+- `client.rs`, `download_store.rs`, `transfer.rs`, `scheduler.rs`, `cdn.rs`, `reader.rs`, `online.rs`, `peer_identity.rs`, `punch_transport.rs`, `webrtc_transport.rs`, `signal_router.rs`, `upload.rs`, `upload_rate.rs`, `upload_progress.rs`, `upload_session.rs`, `admission.rs`, `source_file.rs`, `upload_source.rs`, `upload_cache.rs`, `query.rs`: unit test modules loaded from their source modules through `#[cfg(test)]` and `#[path]`, preserving access to private implementation details.
 - `peer.rs`: authenticated local WebRTC pair fixture, compiled only for unit tests.
 - `destination.rs`: private storage and fault-injection fixtures.
 - `http.rs`: shared local HTTP fixture for unit and integration tests.
@@ -39,3 +39,12 @@ Q2Q_TEST_TRACK_URL=http://127.0.0.1:18086 cargo test -p q2q --test local_sharing
 These cover A→B→C partial relay on one connection, partial/complete announcements, continued seeding after download completion, multiple content routes, duplicate-hash rejection, VOD sharing and cancellation, discovering a later partial source without reopening the reader, closing sharing independently of downloads, and ordinary transfer cancellation withdrawal. Unit tests cover committed-proof indexing and recovery, uncommitted-block exclusion, source tampering, Have updates and bounds, availability-aware exclusive leases and blocking-read cleanup.
 
 `local_sharing` also includes `query_options_paginate_candidates_and_exclude_self`: run it with the `query_options` filter against fresh local Track/Punch to verify QueryOptions, fewer-than-requested responses, opaque pagination, self exclusion and withdrawal.
+
+
+`upload_cache.rs` covers LRU byte accounting, cross-publication budgets/isolation, shared successful reads, zero/oversized budgets, source and proof-file changes, partial destinations, cancellation before/after blocking work and no late backfill after close. `upload_cache_bench.rs` is an ignored warm-filesystem microbenchmark loaded by lib.rs:
+
+```sh
+cargo test -p q2q source_read_workloads -- --ignored --nocapture
+```
+
+It compares the uncached read path with the managed cache/coalescing path for 128 requests from eight workers, using hotspot, distinct, deterministic seek and growing-destination workloads. Timings are informational; deterministic read-call counts and sharing/limit behavior are asserted. It does not measure physical disk reads, cold storage or network throughput.

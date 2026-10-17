@@ -27,6 +27,7 @@ mod source_file;
 mod task_scope;
 pub mod transfer;
 mod upload;
+mod upload_cache;
 mod upload_progress;
 mod upload_rate;
 mod upload_router;
@@ -51,3 +52,7 @@ mod test_http;
 #[cfg(test)]
 #[path = "../tests/destination.rs"]
 mod test_destination;
+
+#[cfg(test)]
+#[path = "../tests/upload_cache_bench.rs"]
+mod upload_cache_bench;
